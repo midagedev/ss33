@@ -41,6 +41,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -89,6 +90,18 @@ type Store struct {
 	root    string
 	mu      sync.RWMutex
 	buckets map[string]*bucket
+	// metas is a snapshot of every bucket's metadata, replaced (under mu) whenever one changes, so Bucket
+	// and ListBuckets, which every request calls, never wait for mu behind a writer.
+	metas atomic.Pointer[map[string]BucketMeta]
+}
+
+// snapshotMetas publishes the current bucket metadata to lock-free readers. Callers hold mu.
+func (s *Store) snapshotMetas() {
+	m := make(map[string]BucketMeta, len(s.buckets))
+	for name, b := range s.buckets {
+		m[name] = b.meta
+	}
+	s.metas.Store(&m)
 }
 
 type bucket struct {
@@ -146,6 +159,7 @@ func Open(root string) (*Store, error) {
 			s.buckets[e.Name()] = b
 		}
 	}
+	s.snapshotMetas()
 	return s, nil
 }
 
@@ -516,6 +530,7 @@ func (s *Store) CreateBucket(name string) error {
 		return err
 	}
 	s.buckets[name] = b
+	s.snapshotMetas()
 	return s.syncDir(s.root)
 }
 
@@ -532,6 +547,7 @@ func (s *Store) DeleteBucket(name string) error {
 	}
 	b.log.Close()
 	delete(s.buckets, name)
+	s.snapshotMetas()
 	trash := filepath.Join(s.root, "."+name+".trash-"+randomID()) // dot-prefixed: Open skips it
 	err := os.Rename(s.bucketDir(name), trash)
 	s.mu.Unlock()
@@ -542,21 +558,18 @@ func (s *Store) DeleteBucket(name string) error {
 }
 
 func (s *Store) Bucket(name string) (BucketMeta, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	b, ok := s.buckets[name]
+	m, ok := (*s.metas.Load())[name]
 	if !ok {
 		return BucketMeta{}, ErrNoSuchBucket
 	}
-	return b.meta, nil
+	return m, nil
 }
 
 func (s *Store) ListBuckets() []BucketMeta {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]BucketMeta, 0, len(s.buckets))
-	for _, b := range s.buckets {
-		out = append(out, b.meta)
+	metas := *s.metas.Load()
+	out := make([]BucketMeta, 0, len(metas))
+	for _, m := range metas {
+		out = append(out, m)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
@@ -574,6 +587,7 @@ func (s *Store) UpdateBucket(name string, update func(*BucketMeta)) error {
 	b.meta.Configs = maps.Clone(b.meta.Configs)
 	update(&b.meta)
 	b.versioning = versioningStatus(b.meta.Configs["versioning"])
+	s.snapshotMetas()
 	return s.writeJSON(filepath.Join(s.bucketDir(name), ".bucket.json"), b.meta)
 }
 

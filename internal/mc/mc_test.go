@@ -49,6 +49,9 @@ func TestBootstrapScript(t *testing.T) {
 	run("mb", "--ignore-existing", "local/run-1")
 	run("cp", "--recursive", "--quiet", "local/seed/", "local/run-1/")
 
+	if buckets := run("ls", "local"); !strings.HasSuffix(strings.Split(buckets, "\n")[0], " run-1/") || !strings.Contains(buckets, "0B seed/\n") {
+		t.Fatalf("ls on a bare alias should list buckets as `... 0B <name>/`:\n%s", buckets)
+	}
 	listing := run("ls", "--recursive", "local/run-1")
 	if n := strings.Count(strings.TrimSpace(listing), "\n") + 1; n != 3 || !strings.Contains(listing, "cases/1/mesh.stl") {
 		t.Fatalf("ls --recursive: %d lines\n%s", n, listing)

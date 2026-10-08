@@ -130,6 +130,9 @@ func run(args []string, stdout io.Writer) error {
 		if len(pos) != 1 {
 			return errors.New("usage: mc ls [--recursive] TARGET")
 		}
+		if a, ok := cfg.Aliases[strings.TrimSuffix(pos[0], "/")]; ok {
+			return target{alias: a}.listBuckets(stdout)
+		}
 		t, err := cfg.target(pos[0])
 		if err != nil {
 			return err
@@ -321,6 +324,29 @@ func (t target) walk(recursive bool, fn func(o listedObject, isPrefix bool) erro
 		}
 		token = out.NextContinuationToken
 	}
+}
+
+// listBuckets prints one `[date]      0B <bucket>/` line per bucket, as `mc ls ALIAS` does.
+func (t target) listBuckets(w io.Writer) error {
+	resp, err := t.do(http.MethodGet, "", nil, nil, 0, nil)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return checkResp(resp, nil, http.StatusOK)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Buckets []struct{ Name, CreationDate string } `xml:"Buckets>Bucket"`
+	}
+	if err := xml.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return err
+	}
+	for _, b := range out.Buckets {
+		ts, _ := time.Parse("2006-01-02T15:04:05.000Z", b.CreationDate)
+		fmt.Fprintf(w, "[%s] %7s %s/\n", ts.Local().Format("2006-01-02 15:04:05 MST"), "0B", b.Name)
+	}
+	return nil
 }
 
 func (t target) list(w io.Writer, recursive bool) error {

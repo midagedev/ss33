@@ -25,5 +25,5 @@ UploadPartCopy, SigV2.
 - `ss33 server <dir> [--address :9000] [--console-address ...]` and `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`
   are accepted, so a compose service can switch images without other changes.
 - The image ships the binary as `mc` too, covering `alias set`, `mb [--ignore-existing]`, `rb [--force]`,
-  `ls [--recursive]`, `cp [--recursive]` (local→remote, remote→remote, remote→local), `anonymous set
+  `ls [--recursive]` (bare `ALIAS` lists buckets), `cp [--recursive]` (local→remote, remote→remote, remote→local), `anonymous set
   download|public|none`, `ready`.

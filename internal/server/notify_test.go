@@ -5,6 +5,7 @@ package server_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -55,12 +56,19 @@ func TestWebhookNotifications(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &server.Server{Store: st, Creds: sigv4.Credentials{AccessKey: testAK, SecretKey: testSK}, Region: "us-east-1",
-		Webhooks: server.WebhooksFromEnv([]string{
-			"MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY=on",
-			"MINIO_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY=" + hook.URL,
-			"MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_PRIMARY=s3cret",
-		})}
+	webhooks, skipped := server.WebhooksFromEnv([]string{
+		"MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY=on",
+		"MINIO_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY=" + hook.URL,
+		"MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_PRIMARY=s3cret",
+		"MINIO_NOTIFY_WEBHOOK_ENABLE_BAD=on",
+		"MINIO_NOTIFY_WEBHOOK_ENDPOINT_BAD=http://bad host/", // once crashed the delivery goroutine
+		"MINIO_NOTIFY_WEBHOOK_ENABLE_OFF=off",
+		"MINIO_NOTIFY_WEBHOOK_ENDPOINT_OFF=http://127.0.0.1:1/",
+	})
+	if len(webhooks) != 1 || fmt.Sprint(skipped) != "[BAD]" {
+		t.Fatalf("targets %v, skipped %v", webhooks, skipped)
+	}
+	srv := &server.Server{Store: st, Creds: sigv4.Credentials{AccessKey: testAK, SecretKey: testSK}, Region: "us-east-1", Webhooks: webhooks}
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 	c := s3.New(s3.Options{Region: "us-east-1", BaseEndpoint: aws.String(ts.URL), UsePathStyle: true,
@@ -107,5 +115,29 @@ func TestWebhookNotifications(t *testing.T) {
 	case e := <-events:
 		t.Fatalf("unexpected event %+v", e)
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// A webhook that is down must never hold up requests: once its queue is full, events are dropped.
+func TestDeadWebhookDoesNotBlock(t *testing.T) {
+	st, _ := store.Open(t.TempDir())
+	srv := &server.Server{Store: st, Creds: sigv4.Credentials{AccessKey: testAK, SecretKey: testSK}, Region: "us-east-1",
+		Webhooks: map[string]server.Webhook{"DOWN": {Endpoint: "http://127.0.0.1:1/"}}}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	c := s3.New(s3.Options{Region: "us-east-1", BaseEndpoint: aws.String(ts.URL), UsePathStyle: true,
+		Credentials: credentials.NewStaticCredentialsProvider(testAK, testSK, "")})
+	mustBucket(t, c, "bkt")
+	if _, err := c.PutBucketNotificationConfiguration(context.Background(), &s3.PutBucketNotificationConfigurationInput{Bucket: aws.String("bkt"),
+		NotificationConfiguration: &types.NotificationConfiguration{QueueConfigurations: []types.QueueConfiguration{{
+			QueueArn: aws.String("arn:minio:sqs::DOWN:webhook"), Events: []types.Event{"s3:ObjectCreated:*"}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	for i := 0; i < 1100; i++ { // past the 1024-event queue
+		put(t, c, &s3.PutObjectInput{Bucket: aws.String("bkt"), Key: aws.String("k"), Body: strings.NewReader("v")})
+	}
+	if d := time.Since(start); d > 20*time.Second {
+		t.Fatalf("1100 PUTs took %v with the webhook down", d)
 	}
 }

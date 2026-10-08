@@ -115,7 +115,11 @@ func serve(args []string) error {
 	st.Durable = *durable
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	srv := &server.Server{Store: st, Creds: sigv4.Credentials{AccessKey: *access, SecretKey: *secret}, Region: *region}
-	srv.Webhooks = server.WebhooksFromEnv(os.Environ())
+	webhooks, skipped := server.WebhooksFromEnv(os.Environ())
+	srv.Webhooks = webhooks
+	for _, id := range skipped {
+		logger.Warn("webhook target ignored: MINIO_NOTIFY_WEBHOOK_ENDPOINT is not an http(s) URL", "target", id)
+	}
 	// MINIO_DOMAIN turns on virtual-hosted requests (<bucket>.<domain>) in MinIO; several may be comma-separated.
 	for _, d := range strings.Split(envOr([]string{"SS33_DOMAIN", "MINIO_DOMAIN"}, ""), ",") {
 		if d = strings.TrimSpace(d); d != "" {

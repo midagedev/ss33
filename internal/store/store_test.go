@@ -445,3 +445,32 @@ func TestListVersionsPaging(t *testing.T) {
 		t.Fatalf("paged %v\n  all %v", paged, all)
 	}
 }
+
+// A key with many versions must not make the journal unreadable or each write slower: every change is a
+// short record, however long the key's history. 64 versions with 300 KB of metadata each once produced a
+// single 19 MB journal line, which made the store refuse to open.
+func TestManyVersionsOfOneKey(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.CreateBucket("bkt")
+	setVersioning(t, s, "bkt", "Enabled")
+	big := map[string]string{"blob": strings.Repeat("m", 300<<10)}
+	for i := 0; i < 64; i++ {
+		if _, err := s.PutObject("bkt", ObjectMeta{Key: "k", UserMeta: big}, strings.NewReader("v"), Precondition{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if info, _ := os.Stat(filepath.Join(dir, "bkt", ".meta.log")); info.Size() > 64*(310<<10) {
+		t.Fatalf("journal is %d bytes for 64 versions", info.Size())
+	}
+	s.Close()
+	if s, err = Open(dir); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if n := len(versionIDs(t, s, "bkt")); n != 64 {
+		t.Fatalf("%d versions after reopen", n)
+	}
+}

@@ -75,7 +75,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	if bucket := s.virtualHostBucket(r.Host); bucket != "" {
+	if bucket := s.virtualHostBucket(r); bucket != "" {
 		// Route by the path-style path. Signature checks still see the request line as the client sent it,
 		// and SigV2's canonical resource is this /bucket/key form anyway.
 		r.URL.Path, r.URL.RawPath = "/"+bucket+r.URL.Path, ""
@@ -111,13 +111,22 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 // virtualHostBucket returns the bucket a virtual-hosted request names in its Host, or "" for path style.
-func (s *Server) virtualHostBucket(host string) string {
+// A configured domain (MINIO_DOMAIN) always means virtual-hosted, as in MinIO. For <name>.localhost, which
+// dev proxies also use as a plain host name, it does only when <name> is a bucket, or for the PUT / that
+// creates one.
+func (s *Server) virtualHostBucket(r *http.Request) string {
+	host := r.Host
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
 	host = strings.ToLower(host)
-	for _, d := range append(s.Domains, "localhost") {
+	for _, d := range s.Domains {
 		if bucket, ok := strings.CutSuffix(host, "."+strings.ToLower(d)); ok && bucket != "" {
+			return bucket
+		}
+	}
+	if bucket, ok := strings.CutSuffix(host, ".localhost"); ok && bucket != "" {
+		if _, err := s.Store.Bucket(bucket); err == nil || r.Method == http.MethodPut && r.URL.Path == "/" {
 			return bucket
 		}
 	}
@@ -159,8 +168,9 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request, bucket, key 
 				return true
 			}
 		}
-		if key != "" && sub == "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-			if m, err := s.Store.HeadObject(bucket, key); err == nil && m.Public {
+		if key != "" && (sub == "" || sub == "partNumber") && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			// The ACL of the version asked for, not of the current one.
+			if m, err := s.Store.Version(bucket, key, r.URL.Query().Get("versionId")); err == nil && m.Public {
 				return true
 			}
 		}
@@ -175,9 +185,9 @@ func anonymousAction(r *http.Request, bucket, key, sub string) (action, resource
 	read := r.Method == http.MethodGet || r.Method == http.MethodHead
 	object := "arn:aws:s3:::" + bucket + "/" + key
 	switch {
-	case key != "" && sub == "" && read && r.URL.Query().Has("versionId"):
+	case key != "" && (sub == "" || sub == "partNumber") && read && r.URL.Query().Has("versionId"):
 		return "s3:GetObjectVersion", object
-	case key != "" && sub == "" && read:
+	case key != "" && (sub == "" || sub == "partNumber") && read:
 		return "s3:GetObject", object
 	case key != "" && sub == "" && r.Method == http.MethodPut && r.Header.Get("X-Amz-Copy-Source") == "":
 		return "s3:PutObject", object
@@ -451,16 +461,20 @@ func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, bucket stri
 			after = string(raw)
 		}
 	}
-	res, err := s.Store.List(bucket, prefix, delimiter, after, max)
-	if err != nil {
-		s.storeErr(w, r, err)
-		return
-	}
 	enc := func(v string) string { return v }
 	encodingType := ""
 	if q.Get("encoding-type") == "url" {
 		encodingType = "url"
 		enc = func(v string) string { return strings.ReplaceAll(url.QueryEscape(v), "%2F", "/") }
+	}
+	if q.Has("versions") {
+		s.listVersions(w, r, bucket, q, max, enc, encodingType)
+		return
+	}
+	res, err := s.Store.List(bucket, prefix, delimiter, after, max)
+	if err != nil {
+		s.storeErr(w, r, err)
+		return
 	}
 	type content struct {
 		Key          string
@@ -490,10 +504,6 @@ func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, bucket stri
 	prefixes := make([]commonPrefix, 0, len(res.CommonPrefixes))
 	for _, p := range res.CommonPrefixes {
 		prefixes = append(prefixes, commonPrefix{enc(p)})
-	}
-	if q.Has("versions") {
-		s.listVersions(w, r, bucket, q, max, enc, encodingType)
-		return
 	}
 	if v2 {
 		out := struct {
@@ -1009,6 +1019,9 @@ func (s *Server) partRange(w http.ResponseWriter, r *http.Request, meta store.Ob
 // getAttributes answers GetObjectAttributes for the attributes ss33 has: ETag, size, storage class and parts.
 func (s *Server) getAttributes(w http.ResponseWriter, r *http.Request, bucket, key, versionID string) {
 	m, err := s.Store.Version(bucket, key, versionID)
+	if err == nil {
+		err = checkCustomerKey(r.Header, "", m)
+	}
 	if err != nil {
 		s.storeErr(w, r, err)
 		return
@@ -1126,11 +1139,16 @@ func (s *Server) uploadPartCopy(w http.ResponseWriter, r *http.Request, bucket, 
 	}
 	srcBucket, srcKey, srcVersion := copySource(r)
 	src, f, err := s.Store.OpenVersion(srcBucket, srcKey, srcVersion)
+	if f != nil {
+		defer f.Close()
+	}
+	if err == nil {
+		err = checkCustomerKey(r.Header, copySourcePrefix, src)
+	}
 	if err != nil {
 		s.storeErr(w, r, err)
 		return
 	}
-	defer f.Close()
 	var body io.Reader = f
 	if rng := r.Header.Get("X-Amz-Copy-Source-Range"); rng != "" {
 		first, last, ok := parseByteRange(rng)

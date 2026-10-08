@@ -88,7 +88,13 @@ func (s *Server) notify(r *http.Request, bucket, event string, meta store.Object
 		if !ok || !eventMatches(q.Events, event) || !keyMatches(q.Rules, meta.Key) {
 			continue
 		}
-		s.webhookQueue(id, target) <- eventPayload(r, s.Region, s.Creds.AccessKey, bucket, event, q.ID, meta)
+		select {
+		case s.webhookQueue(id, target) <- eventPayload(r, s.Region, s.Creds.AccessKey, bucket, event, q.ID, meta):
+		default: // the target is down and its queue full: drop rather than hold up the request
+			if s.Log != nil {
+				s.Log.Warn("webhook queue full, event dropped", "target", id, "event", event, "key", meta.Key)
+			}
+		}
 	}
 }
 
@@ -180,7 +186,13 @@ func (s *Server) deliver(id string, target Webhook, q chan []byte) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	for body := range q {
 		for attempt := 0; attempt < 5; attempt++ {
-			req, _ := http.NewRequest(http.MethodPost, target.Endpoint, bytes.NewReader(body))
+			req, err := http.NewRequest(http.MethodPost, target.Endpoint, bytes.NewReader(body))
+			if err != nil { // WebhooksFromEnv validates endpoints; a Server built by hand may not
+				if s.Log != nil {
+					s.Log.Error("webhook endpoint unusable", "target", id, "err", err)
+				}
+				break
+			}
 			req.Header.Set("Content-Type", "application/json")
 			if t := target.AuthToken; t != "" {
 				if !strings.Contains(t, " ") {
@@ -219,8 +231,9 @@ func (s *Server) notifyDelete(r *http.Request, bucket, key string, d store.Delet
 
 // WebhooksFromEnv reads MinIO's webhook target settings: MINIO_NOTIFY_WEBHOOK_ENABLE_<ID>=on with
 // MINIO_NOTIFY_WEBHOOK_ENDPOINT_<ID> and optionally MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_<ID>. The variables
-// without a suffix define the target "_", as in MinIO.
-func WebhooksFromEnv(environ []string) map[string]Webhook {
+// without a suffix define the target "_", as in MinIO. Enabled targets without a usable http(s) endpoint
+// are returned in skipped.
+func WebhooksFromEnv(environ []string) (targets map[string]Webhook, skipped []string) {
 	env := map[string]string{}
 	for _, kv := range environ {
 		if k, v, ok := strings.Cut(kv, "="); ok {
@@ -228,7 +241,7 @@ func WebhooksFromEnv(environ []string) map[string]Webhook {
 		}
 	}
 	const prefix = "MINIO_NOTIFY_WEBHOOK_"
-	targets := map[string]Webhook{}
+	targets = map[string]Webhook{}
 	for k, v := range env {
 		rest, ok := strings.CutPrefix(k, prefix+"ENABLE")
 		if !ok || (rest != "" && !strings.HasPrefix(rest, "_")) || !(strings.EqualFold(v, "on") || strings.EqualFold(v, "true")) {
@@ -238,9 +251,12 @@ func WebhooksFromEnv(environ []string) map[string]Webhook {
 		if id == "" {
 			id = "_"
 		}
-		if endpoint := env[prefix+"ENDPOINT"+rest]; endpoint != "" {
-			targets[id] = Webhook{Endpoint: endpoint, AuthToken: env[prefix+"AUTH_TOKEN"+rest]}
+		endpoint := env[prefix+"ENDPOINT"+rest]
+		if u, err := url.Parse(endpoint); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			skipped = append(skipped, id)
+			continue
 		}
+		targets[id] = Webhook{Endpoint: endpoint, AuthToken: env[prefix+"AUTH_TOKEN"+rest]}
 	}
-	return targets
+	return targets, skipped
 }

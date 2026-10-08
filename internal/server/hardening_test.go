@@ -4,16 +4,20 @@ package server_test
 // bodies. Each case once got a wrong answer.
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/base64"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
@@ -193,5 +197,72 @@ func TestDeclaredDigestsAreChecked(t *testing.T) {
 	if _, err := c.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String("bkt"), Key: aws.String("k"), Body: strings.NewReader("payload"),
 		ContentMD5: aws.String(base64.StdEncoding.EncodeToString(sum[:]))}); err != nil {
 		t.Fatalf("correct Content-MD5: %v", err)
+	}
+}
+
+// Review findings on versioning, SSE-C and configuration reads; each once failed.
+func TestVersionedACLAndCopySources(t *testing.T) {
+	ctx := context.Background()
+	ts, c := newServer(t)
+	mustBucket(t, c, "bkt")
+	setBucketVersioning(t, c, "bkt", types.BucketVersioningStatusEnabled)
+	old, _ := c.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String("bkt"), Key: aws.String("k"), Body: strings.NewReader("private")})
+	put(t, c, &s3.PutObjectInput{Bucket: aws.String("bkt"), Key: aws.String("k"), Body: strings.NewReader("public"), ACL: types.ObjectCannedACLPublicRead})
+	if got := anonymousStatus(t, ts.URL+"/bkt/k"); got != http.StatusOK {
+		t.Fatalf("anonymous GET of the public current version: %d", got)
+	}
+	if got := anonymousStatus(t, ts.URL+"/bkt/k?versionId="+aws.ToString(old.VersionId)); got != http.StatusForbidden {
+		t.Fatalf("anonymous GET of the private old version: %d, want 403", got)
+	}
+
+	// UploadPartCopy from an SSE-C object needs the source key, like CopyObject.
+	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("k"), 32))
+	sum := md5.Sum(bytes.Repeat([]byte("k"), 32))
+	keyMD5 := base64.StdEncoding.EncodeToString(sum[:])
+	put(t, c, &s3.PutObjectInput{Bucket: aws.String("bkt"), Key: aws.String("secret"), Body: strings.NewReader("s"),
+		SSECustomerAlgorithm: aws.String("AES256"), SSECustomerKey: aws.String(key), SSECustomerKeyMD5: aws.String(keyMD5)})
+	up, _ := c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String("bkt"), Key: aws.String("copy")})
+	if _, err := c.UploadPartCopy(ctx, &s3.UploadPartCopyInput{Bucket: aws.String("bkt"), Key: aws.String("copy"), UploadId: up.UploadId,
+		PartNumber: aws.Int32(1), CopySource: aws.String("bkt/secret")}); errCode(err) != "InvalidRequest" {
+		t.Fatalf("UploadPartCopy without the source key: %v", err)
+	}
+	if _, err := c.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{Bucket: aws.String("bkt"), Key: aws.String("secret"),
+		ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesObjectSize}}); errCode(err) != "InvalidRequest" {
+		t.Fatalf("GetObjectAttributes without the key: %v", err)
+	}
+}
+
+// Bucket configuration changes while objects are written: run with -race.
+func TestConfigChangesRaceWithWrites(t *testing.T) {
+	ctx := context.Background()
+	_, c := newServer(t)
+	mustBucket(t, c, "bkt")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 50; i++ {
+			c.PutBucketTagging(ctx, &s3.PutBucketTaggingInput{Bucket: aws.String("bkt"), Tagging: &types.Tagging{
+				TagSet: []types.Tag{{Key: aws.String("n"), Value: aws.String(fmt.Sprint(i))}}}})
+		}
+	}()
+	for i := 0; i < 50; i++ {
+		put(t, c, &s3.PutObjectInput{Bucket: aws.String("bkt"), Key: aws.String("k"), Body: strings.NewReader("v")})
+	}
+	<-done
+}
+
+// Path style keeps working for endpoints such as http://s3.localhost that dev proxies hand out.
+func TestPathStyleOnLocalhostSubdomain(t *testing.T) {
+	ts, _ := newServer(t)
+	_, port, _ := net.SplitHostPort(ts.Listener.Addr().String())
+	c := s3.New(s3.Options{Region: "us-east-1", BaseEndpoint: aws.String("http://s3.localhost:" + port), UsePathStyle: true,
+		HTTPClient: dialAll(ts.Listener.Addr().String()), Credentials: credentials.NewStaticCredentialsProvider(testAK, testSK, "")})
+	mustBucket(t, c, "bkt")
+	put(t, c, &s3.PutObjectInput{Bucket: aws.String("bkt"), Key: aws.String("k"), Body: strings.NewReader("v")})
+	if got := getBody(t, c, "bkt", "k", ""); got != "v" {
+		t.Fatalf("GET: %q", got)
+	}
+	if out, err := c.ListBuckets(context.Background(), &s3.ListBucketsInput{}); err != nil || len(out.Buckets) != 1 {
+		t.Fatalf("ListBuckets: %+v %v", out, err)
 	}
 }

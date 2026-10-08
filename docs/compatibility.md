@@ -36,8 +36,10 @@ pagination of ListMultipartUploads and ListParts.
   (or the legacy `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`) are accepted, so a compose service or a
   Testcontainers MinIO module can switch images without other changes.
 - The image ships the binary as `mc` too, covering:
-  - `alias set` and the older `config host add`; `MC_HOST_<alias>=http://KEY:SECRET@host:port` also defines an alias
+  - `alias set` and the older `config host add` (`--api`/`--path` values are ignored); `MC_HOST_<alias>=http://KEY:SECRET@host:port` also defines an alias
   - `mb [--ignore-existing]`, `rb [--force]`
   - `ls [--recursive]`; a bare `ALIAS` lists buckets
   - `cp [--recursive]`: local→remote, remote→remote and remote→local
+  - `rm ALIAS/BUCKET/KEY`, `rm --recursive --force ALIAS/BUCKET[/PREFIX]`
+  - `version enable|suspend` (stored only; see above)
   - `anonymous set download|public|none`, `ready`

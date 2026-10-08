@@ -1,5 +1,6 @@
 // Package mc is the subset of the MinIO client CLI that bootstrap scripts use, talking to any S3
-// endpoint: alias set, mb, rb, ls, cp, anonymous set/get. Output mirrors mc closely enough that
+// endpoint: alias set (and config host add, MC_HOST_*), mb, rb, ls, cp, rm, anonymous/policy set, version
+// enable/suspend, ready. Output mirrors mc closely enough that
 // `mc ls --recursive ... | wc -l` style scripts keep working.
 package mc
 
@@ -88,9 +89,14 @@ type flags map[string]bool
 func parseArgs(args []string) (flags, []string) {
 	f := flags{}
 	var pos []string
-	for _, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		if strings.HasPrefix(a, "-") && len(a) > 1 {
-			f[strings.TrimLeft(a, "-")] = true
+			name := strings.TrimLeft(a, "-")
+			f[name] = true
+			if (name == "api" || name == "path") && i+1 < len(args) { // `--api S3v4`, `--path auto`: values ss33 ignores
+				i++
+			}
 			continue
 		}
 		pos = append(pos, a)
@@ -100,7 +106,7 @@ func parseArgs(args []string) (flags, []string) {
 
 func run(args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: mc <alias|mb|rb|ls|cp|anonymous|ready> ...")
+		return errors.New("usage: mc <alias|mb|rb|ls|cp|rm|anonymous|version|ready> ...")
 	}
 	cfg := loadConfig()
 	f, pos := parseArgs(args[1:])
@@ -162,6 +168,52 @@ func run(args []string, stdout io.Writer) error {
 			return errors.New("usage: mc cp [--recursive] SOURCE TARGET")
 		}
 		return cfg.copy(pos[0], pos[1], f["recursive"] || f["r"], stdout, f["quiet"] || f["q"])
+	case "rm":
+		for _, p := range pos {
+			t, err := cfg.target(p)
+			if err != nil {
+				return err
+			}
+			name, _, _ := strings.Cut(p, "/")
+			remove := func(key string) error {
+				if err := t.call(http.MethodDelete, key, nil, nil, 0, nil, http.StatusNoContent, http.StatusOK); err != nil {
+					return err
+				}
+				fmt.Fprintf(stdout, "Removed `%s/%s/%s`.\n", name, t.bucket, key)
+				return nil
+			}
+			switch {
+			case f["recursive"] || f["r"]:
+				if !f["force"] {
+					return errors.New("removal requires --force flag")
+				}
+				if err := t.walk(true, func(o listedObject, _ bool) error { return remove(o.Key) }); err != nil {
+					return err
+				}
+			case t.key == "":
+				return fmt.Errorf("%q is a bucket; use `rm --recursive --force` to empty it or `rb` to remove it", p)
+			default:
+				if err := remove(t.key); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	case "version":
+		status := map[string]string{"enable": "Enabled", "suspend": "Suspended"}
+		if len(pos) != 2 || status[pos[0]] == "" {
+			return errors.New("usage: mc version enable|suspend ALIAS/BUCKET")
+		}
+		t, err := cfg.target(pos[1])
+		if err != nil {
+			return err
+		}
+		body := `<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>` + status[pos[0]] + `</Status></VersioningConfiguration>`
+		if err := t.call(http.MethodPut, "", url.Values{"versioning": {""}}, strings.NewReader(body), int64(len(body)), nil, http.StatusOK); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "%s versioning is %sd\n", pos[1], pos[0])
+		return nil
 	case "anonymous", "policy":
 		if len(pos) == 3 && pos[0] == "set" {
 			t, err := cfg.target(pos[2])
@@ -189,7 +241,7 @@ func run(args []string, stdout io.Writer) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("unsupported command %q (ss33 implements alias, mb, rb, ls, cp, anonymous, ready)", args[0])
+	return fmt.Errorf("unsupported command %q (ss33 implements alias, mb, rb, ls, cp, rm, anonymous, version, ready)", args[0])
 }
 
 // target is an `alias/bucket/prefix` reference.

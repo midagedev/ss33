@@ -66,6 +66,17 @@ func TestBootstrapScript(t *testing.T) {
 		t.Fatalf("anonymous download after `anonymous set download`: %s", resp.Status)
 	}
 
+	run("rm", "local/run-1/a.json")
+	if out := run("rm", "--recursive", "--force", "local/run-1/cases/"); strings.Count(out, "Removed `local/run-1/cases/1/") != 2 {
+		t.Fatalf("rm --recursive --force:\n%s", out)
+	}
+	if listing := run("ls", "--recursive", "local/run-1"); listing != "" {
+		t.Fatalf("objects left after rm:\n%s", listing)
+	}
+	run("version", "enable", "local/run-1")
+	if m, _ := st.Bucket("run-1"); !strings.Contains(m.Configs["versioning"], "Enabled") {
+		t.Fatalf("version enable: %+v", m.Configs)
+	}
 	run("rb", "--force", "local/run-1")
 	if _, err := st.Bucket("run-1"); err == nil {
 		t.Fatal("bucket survived rb --force")
@@ -87,7 +98,7 @@ func TestAliasFromEnvAndConfigHost(t *testing.T) {
 
 	for _, args := range [][]string{
 		{"mb", "fromenv/one"},
-		{"config", "host", "add", "legacy", ts.URL, "admin", "admin-secret"},
+		{"config", "host", "add", "legacy", ts.URL, "admin", "admin-secret", "--api", "S3v4"},
 		{"mb", "legacy/two"},
 	} {
 		var errOut bytes.Buffer

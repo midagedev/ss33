@@ -75,7 +75,6 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	q.Del("x-id") // aws-sdk-go-v2 tags requests with ?x-id=<Operation>; it is not a subresource
 	switch {
 	case bucket == "":
 		if r.Method != http.MethodGet {
@@ -265,7 +264,7 @@ func subresource(q url.Values) string {
 	var subs []string
 	for k := range q {
 		switch {
-		case isAuthParam(k), strings.HasPrefix(k, "response-"), listParams[k],
+		case isAuthParam(k), strings.HasPrefix(k, "response-"), listParams[k], k == "x-id", // aws-sdk-go-v2 tags requests with ?x-id=<Operation>
 			k == "partNumber" && q.Has("uploadId"),
 			k == "versionId" && q.Get(k) == "null": // every object is the "null" version
 		default:

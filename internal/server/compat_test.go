@@ -125,6 +125,13 @@ func TestObjectACL(t *testing.T) {
 	if status("pub") != http.StatusOK || status("priv") != http.StatusForbidden {
 		t.Fatalf("anonymous GET: public=%d private=%d", status("pub"), status("priv"))
 	}
+	// An anonymous SDK client adds ?x-id=GetObject; that must not count as a subresource.
+	anon := s3.New(s3.Options{Region: "us-east-1", BaseEndpoint: aws.String(ts.URL), UsePathStyle: true, Credentials: aws.AnonymousCredentials{}})
+	if out, err := anon.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("bkt"), Key: aws.String("pub")}); err != nil {
+		t.Fatalf("anonymous SDK GetObject on a public-read object: %v", err)
+	} else {
+		out.Body.Close()
+	}
 	acl, err := c.GetObjectAcl(ctx, &s3.GetObjectAclInput{Bucket: aws.String("bkt"), Key: aws.String("pub")})
 	if err != nil || len(acl.Grants) != 2 || acl.Grants[1].Permission != types.PermissionRead || aws.ToString(acl.Grants[1].Grantee.URI) != "http://acs.amazonaws.com/groups/global/AllUsers" {
 		t.Fatalf("GetObjectAcl: %v %+v", err, acl)

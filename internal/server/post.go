@@ -36,7 +36,7 @@ func (s *Server) postObject(w http.ResponseWriter, r *http.Request, bucket strin
 		s.fail(w, r, http.StatusBadRequest, "MalformedPOSTRequest", "The body of your POST request is not well-formed multipart/form-data.")
 		return
 	}
-	fields := map[string]string{"bucket": bucket} // lowercased names, as S3 matches them
+	fields := map[string]string{} // lowercased names, as S3 matches them
 	for {
 		part, err := mr.NextPart()
 		if err != nil {
@@ -44,11 +44,15 @@ func (s *Server) postObject(w http.ResponseWriter, r *http.Request, bucket strin
 			return
 		}
 		name := strings.ToLower(part.FormName())
+		if name == "bucket" {
+			continue // the bucket is the one in the URL; a form field must not move the upload elsewhere
+		}
 		if name != "file" {
 			v, _ := io.ReadAll(io.LimitReader(part, 64<<10))
 			fields[name] = string(v)
 			continue
 		}
+		fields["bucket"] = bucket
 		if fields["content-type"] == "" {
 			fields["content-type"] = part.Header.Get("Content-Type")
 		}

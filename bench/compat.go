@@ -36,14 +36,21 @@ func compatChecks(c *s3.Client, ep, ak, sk, b string) []struct {
 		_, err := c.PutObject(ctx, in)
 		return err
 	}
-	anonGet := func(key string) error {
-		resp, err := http.Get(ep + "/" + b + "/" + key)
-		if err != nil {
-			return err
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("anonymous GET: %s", resp.Status)
+	// anonRead checks that privateURL is refused and publicURL served without credentials: a server that
+	// lets everyone read everything must not pass.
+	anonRead := func(privateURL, publicURL string) error {
+		for _, u := range []struct {
+			url  string
+			want int
+		}{{privateURL, http.StatusForbidden}, {publicURL, http.StatusOK}} {
+			resp, err := http.Get(u.url)
+			if err != nil {
+				return err
+			}
+			resp.Body.Close()
+			if resp.StatusCode != u.want {
+				return fmt.Errorf("anonymous GET %s: %s, want %d", u.url, resp.Status, u.want)
+			}
 		}
 		return nil
 	}
@@ -107,21 +114,19 @@ func compatChecks(c *s3.Client, ep, ak, sk, b string) []struct {
 			if _, err := c.PutObject(ctx, &s3.PutObjectInput{Bucket: &pb, Key: str("x"), Body: strings.NewReader("x")}); err != nil {
 				return err
 			}
-			resp, err := http.Get(ep + "/" + pb + "/x")
-			if err != nil {
+			if err := putText("private.txt", "p"); err != nil {
 				return err
 			}
-			resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				return fmt.Errorf("anonymous GET: %s", resp.Status)
-			}
-			return nil
+			return anonRead(ep+"/"+b+"/private.txt", ep+"/"+pb+"/x")
 		}},
 		{"Object ACL public-read: anonymous read", func() error {
 			if err := putText("acl.txt", "pub", func(in *s3.PutObjectInput) { in.ACL = types.ObjectCannedACLPublicRead }); err != nil {
 				return err
 			}
-			return anonGet("acl.txt")
+			if err := putText("private.txt", "p"); err != nil {
+				return err
+			}
+			return anonRead(ep+"/"+b+"/private.txt", ep+"/"+b+"/acl.txt")
 		}},
 		{"GetObjectAcl", func() error {
 			_, err := c.GetObjectAcl(ctx, &s3.GetObjectAclInput{Bucket: &b, Key: str("acl.txt")})

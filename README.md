@@ -171,7 +171,7 @@ sleep 10; docker stats --no-stream --format '{{.MemUsage}}' bench   # idle memor
 | Checksums | `x-amz-checksum-{crc32,crc32c,crc64nvme,sha1,sha256}` returned on PutObject | |
 | Addressing | Path-style | Virtual-hosted |
 | Browser | CORS allows every origin and exposes `ETag` | |
-| `mc` | `alias set`, `config host add`, `MC_HOST_<alias>`, `mb [--ignore-existing\|-p]`, `rb [--force]`, `ls [--recursive]`, `cp [--recursive]`, `anonymous\|policy set download\|public\|none`, `ready` | Everything else, including `mc admin` and `mc mirror` |
+| `mc` | `alias set`, `config host add`, `MC_HOST_<alias>`, `mb [--ignore-existing\|-p]`, `rb [--force]`, `ls [--recursive]`, `cp [--recursive]`, `rm [--recursive --force]`, `anonymous\|policy set download\|public\|none`, `version enable`, `ready` | Everything else, including `mc admin` and `mc mirror` |
 
 Unsupported operations return `501 NotImplemented` as an S3 XML error. They never fail silently.
 The full list is in [docs/compatibility.md](docs/compatibility.md).

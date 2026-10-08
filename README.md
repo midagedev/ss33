@@ -93,6 +93,8 @@ Point SDKs at the endpoint with path-style addressing, for example `forcePathSty
 | Idle memory | **2.1 MiB** | 85.5 MiB |
 
 Measured on an Apple M4 Pro with Docker 29.5.2 (linux/arm64), 2026-10-08.
+This is not a performance claim. MinIO is a full distributed object store and does far more; these numbers only
+show what a test double costs in a dev stack.
 
 <details>
 <summary>How these were measured</summary>
@@ -149,3 +151,6 @@ S3-compatible server.
 ## License
 
 [Apache-2.0](LICENSE)
+
+MinIO is a trademark of MinIO, Inc. ss33 is an independent project, not affiliated with or endorsed by MinIO, Inc.,
+and contains no MinIO code.

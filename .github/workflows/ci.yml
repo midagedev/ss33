@@ -142,6 +142,26 @@ jobs:
             CGO_ENABLED=0 GOBIN=/tmp/mc-$release go install github.com/minio/mc@$release
             bash clients/mc.sh http://127.0.0.1:9000 /tmp/mc-$release/mc
           done
+          ln -s /tmp/mc-d6541ea280b73a834b64d4097e21f2be77676104/mc /tmp/mc-latest
+
+      - name: Webhook notifications (official mc event add)
+        if: ${{ !cancelled() }}
+        run: bash clients/webhook.sh ss33:local /tmp/mc-latest
+
+      - name: Docker registry (S3 storage driver)
+        if: ${{ !cancelled() }}
+        run: bash clients/registry.sh ss33:local 5000
+
+      - name: Set up Terraform
+        if: ${{ !cancelled() }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.5
+          terraform_wrapper: false
+
+      - name: Terraform AWS provider
+        if: ${{ !cancelled() }}
+        run: bash clients/terraform.sh http://127.0.0.1:9000
 
       - name: Testcontainers for Java (MinIOContainer)
         if: ${{ !cancelled() }}

@@ -215,15 +215,18 @@ the response.
 
 | Area | Supported | Not supported |
 |---|---|---|
-| Objects | Put (incl. `If-None-Match: *`, `If-Match`), Get (Range, conditional, `response-*` overrides), Head, GetObjectAttributes, Delete, DeleteObjects, CopyObject, `x-amz-meta-*`, tagging, canned ACLs (`public-read` allows anonymous GET) | Object lock, SelectObjectContent |
-| Buckets | Create, Delete, Head, List, Location, ListObjects v1/v2, ListObjectVersions, bucket policy (public-read), ACL (read) | Notifications, replication, website |
-| Bucket configuration | Versioning, CORS, lifecycle, encryption and tags are stored and returned, not enforced | Keeping old versions, expiring objects |
-| Multipart | Create, UploadPart, UploadPartCopy, Complete, Abort, ListParts, ListMultipartUploads | |
-| Auth | SigV4 header and presigned URLs (expiry and clock skew enforced), SigV2 presigned URLs (boto3's default), browser POST policy uploads, `aws-chunked` streaming, anonymous requests the bucket policy allows (Deny wins), anonymous GET on `public-read` objects | SigV2 headers, multiple users, STS |
-| Checksums | `x-amz-checksum-{crc32,crc32c,crc64nvme,sha1,sha256}` returned on PutObject | |
-| Addressing | Path-style | Virtual-hosted |
+| Objects | Put (incl. `If-None-Match: *`, `If-Match`), Get (Range, `partNumber`, conditional, `response-*` overrides), Head, GetObjectAttributes, Delete, DeleteObjects, CopyObject, `x-amz-meta-*`, tagging, canned ACLs (`public-read` allows anonymous GET), storage classes | Object lock, SelectObjectContent, RestoreObject |
+| Versioning | Version IDs, delete markers, GET/HEAD/copy/delete of a version, ListObjectVersions, suspended buckets | |
+| Notifications | Webhooks configured as in MinIO (`MINIO_NOTIFY_WEBHOOK_*`, `mc event add`), with S3 event JSON | SNS, SQS, Lambda, Kafka and other targets |
+| Buckets | Create, Delete, Head, List (paged), Location, ListObjects v1/v2, bucket policy (evaluated, Deny wins), ACL (read) | Website hosting |
+| Bucket configuration | CORS, lifecycle, encryption, tags, website, replication, public access block, ownership controls, logging: stored and returned, enough for Terraform | Expiring objects, enforcing any of them |
+| Multipart | Create, UploadPart, UploadPartCopy, Complete (conditional too), Abort, ListParts (paged), ListMultipartUploads | |
+| Auth | SigV4 header and presigned URLs (expiry and clock skew enforced), SigV2 presigned URLs (boto3's default), browser POST policy uploads, `aws-chunked` streaming, anonymous requests the bucket policy allows | SigV2 headers, multiple users, STS |
+| Integrity | `Content-MD5` and `x-amz-checksum-{crc32,crc32c,crc64nvme,sha1,sha256}` checked (`BadDigest` on mismatch) and returned | |
+| Encryption | SSE-S3/SSE-KMS headers and bucket default encryption reported; SSE-C objects need their key | Actual encryption at rest |
+| Addressing | Path-style; virtual-hosted for `<bucket>.localhost` and `MINIO_DOMAIN` | |
 | Browser | CORS allows every origin and exposes `ETag` | |
-| `mc` | `alias set`, `config host add`, `MC_HOST_<alias>`, `mb [--ignore-existing\|-p]`, `rb [--force]`, `ls [--recursive]`, `cp [--recursive]`, `rm [--recursive --force]`, `anonymous\|policy set download\|public\|none`, `version enable`, `ready` | Everything else, including `mc admin` and `mc mirror` |
+| `mc` | `alias set`, `config host add`, `MC_HOST_<alias>`, `mb [--ignore-existing\|-p]`, `rb [--force]`, `ls [--recursive\|--versions]`, `cp [--recursive]`, `rm [--recursive --force\|--version-id]`, `anonymous\|policy set download\|public\|none`, `version enable\|suspend`, `event add\|ls\|rm`, `ready` | Everything else, including `mc admin` and `mc mirror` |
 
 Unsupported operations return `501 NotImplemented` as an S3 XML error. They never fail silently.
 The full list is in [docs/compatibility.md](docs/compatibility.md).
@@ -236,19 +239,25 @@ Every push runs these against the image built from that commit ([`clients/`](cli
 | Client | What runs |
 |---|---|
 | aws-sdk-go-v2 | The test suite in [`internal/`](internal), operation by operation, plus an `mc` bootstrap script |
-| boto3 1.43 | `upload_fileobj`/`download_fileobj`, managed `copy`, paginators, `generate_presigned_url` (SigV2 and SigV4), `generate_presigned_post`, tagging, ACLs, conditional PUT |
+| boto3 1.43 | `upload_fileobj`/`download_fileobj`, managed `copy`, paginators, `generate_presigned_url` (SigV2 and SigV4), `generate_presigned_post`, tagging, ACLs, conditional PUT, versioning, SSE, `PartNumber`, `BadDigest` |
 | AWS SDK for JavaScript v3 | `@aws-sdk/client-s3`, `lib-storage` `Upload`, `s3-request-presigner`, paginators, Range |
 | AWS SDK for Java 2.55 | `S3Client`, `S3AsyncClient` with `multipartEnabled`, `S3Presigner` for GET, PUT and UploadPart |
 | AWS CLI v2 | `s3 mb/cp/sync/ls/presign/rb --force`, `s3api` tagging and head-object |
-| Official `mc` (last release and RELEASE.2025-01-17) | `alias set`, `ready`, `mb`, `anonymous set`, `cp --recursive`, `ls`, `diff`, `mirror`, `stat`, `cat`, `rm`, `rb --force` |
+| Official `mc` (last release and RELEASE.2025-01-17) | `alias set`, `ready`, `mb`, `anonymous set`, `cp --recursive`, `ls`, `diff`, `mirror`, `stat`, `cat`, `rm`, `version enable`, `ls --versions`, `rb --force`, and `event add` with a webhook receiving the events |
+| Docker registry 3 | The S3 storage driver: push and pull a multi-layer image, delete it, garbage-collect |
+| Terraform, AWS provider 6.68 | A bucket with versioning, encryption, lifecycle, CORS, policy, public access block, ownership controls, website, tags and an object: apply, a plan with no changes, destroy |
 | Testcontainers | Java `MinIOContainer` and Python `MinioContainer` with the image substituted |
 | Docker Compose | The [drop-in example](#drop-in-replacement) above, run as written |
+
+Checked by hand: rclone, restic, s3cmd, s5cmd, DuckDB, pandas with s3fs, pyarrow, Polars, Grafana Loki,
+Thanos, MLflow, PyIceberg, the PHP (and Flysystem), Ruby, .NET and Rust AWS SDKs, and the MinIO Go,
+JavaScript and Python SDKs.
 
 ## Non-goals
 
 ss33 is a test double, not a storage system. It has no production durability guarantees, no web console, no
-version history or replication, no clustering, and only one set of credentials. For those, use real S3 or a full
-S3-compatible server.
+replication, no clustering, and only one set of credentials. Configurations such as lifecycle rules are
+stored, not enforced. For those, use real S3 or a full S3-compatible server.
 
 ## Developing
 

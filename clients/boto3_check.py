@@ -156,6 +156,54 @@ check("default addressing (no addressing_style)",
       lambda: client().put_object(Bucket=B, Key="default.txt", Body=b"default"))
 
 
+def versioning():
+    vb = B + "-ver"
+    s3.create_bucket(Bucket=vb)
+    s3.put_bucket_versioning(Bucket=vb, VersioningConfiguration={"Status": "Enabled"})
+    v1 = s3.put_object(Bucket=vb, Key="k", Body=b"one")["VersionId"]
+    s3.put_object(Bucket=vb, Key="k", Body=b"two")
+    eq(s3.get_object(Bucket=vb, Key="k", VersionId=v1)["Body"].read(), b"one")
+    marker = s3.delete_object(Bucket=vb, Key="k")
+    assert marker["DeleteMarker"], marker
+    listed = s3.list_object_versions(Bucket=vb)
+    eq((len(listed["Versions"]), len(listed["DeleteMarkers"])), (2, 1))
+    s3.delete_object(Bucket=vb, Key="k", VersionId=marker["VersionId"])  # undelete
+    eq(s3.get_object(Bucket=vb, Key="k")["Body"].read(), b"two")
+    # Empty the versioned bucket the way test cleanups do, through the paginator.
+    for page in s3.get_paginator("list_object_versions").paginate(Bucket=vb):
+        ids = [{"Key": v["Key"], "VersionId": v["VersionId"]} for v in page.get("Versions", []) + page.get("DeleteMarkers", [])]
+        if ids:
+            s3.delete_objects(Bucket=vb, Delete={"Objects": ids})
+    s3.delete_bucket(Bucket=vb)
+
+
+check("versioning: old versions, delete markers, undelete, empty the bucket", versioning)
+
+
+def encryption():
+    out = s3.put_object(Bucket=B, Key="sse.txt", Body=b"x", ServerSideEncryption="AES256", StorageClass="STANDARD_IA")
+    eq(out["ServerSideEncryption"], "AES256")
+    head = s3.head_object(Bucket=B, Key="sse.txt")
+    eq((head["ServerSideEncryption"], head["StorageClass"]), ("AES256", "STANDARD_IA"))
+
+
+check("SSE and storage class are returned", encryption)
+check("get_object PartNumber (multipart object)",
+      lambda: eq(s3.get_object(Bucket=B, Key="big.bin", PartNumber=2)["PartsCount"] > 1, True))
+
+
+def bad_md5():
+    try:
+        s3.put_object(Bucket=B, Key="corrupt", Body=b"payload", ContentMD5="1B2M2Y8AsgTpgAmY7PhCfg==")
+    except s3.exceptions.ClientError as e:
+        eq(e.response["Error"]["Code"], "BadDigest")
+        return
+    raise AssertionError("a body that does not match Content-MD5 was stored")
+
+
+check("put_object with a wrong Content-MD5 is BadDigest", bad_md5)
+
+
 def delete_all():
     keys = [{"Key": o["Key"]} for o in s3.list_objects_v2(Bucket=B).get("Contents", [])]
     s3.delete_objects(Bucket=B, Delete={"Objects": keys})

@@ -29,6 +29,10 @@ check "mirror" '"$mc" mb local/clients-mc-mirror && "$mc" mirror local/clients-m
 check "stat" '"$mc" stat local/clients-mc/a/1.txt'
 check "cat" '[ "$("$mc" cat local/clients-mc/a/1.txt)" = hello ]'
 check "rm" '"$mc" rm local/clients-mc/a/1.txt'
+check "version enable, ls --versions, rm leaves a delete marker" '"$mc" mb local/clients-mc-ver && "$mc" version enable local/clients-mc-ver &&
+  "$mc" cp "$work/seed/a/1.txt" local/clients-mc-ver/k && "$mc" cp "$work/seed/a/1.txt" local/clients-mc-ver/k && "$mc" rm local/clients-mc-ver/k &&
+  [ "$("$mc" ls --versions local/clients-mc-ver | wc -l)" -eq 3 ] && [ -z "$("$mc" ls local/clients-mc-ver)" ]'
+check "rb --force on a versioned bucket" '"$mc" rb --force local/clients-mc-ver'
 check "rb --force" '"$mc" rb --force local/clients-mc && "$mc" rb --force local/clients-mc-copy && "$mc" rb --force local/clients-mc-mirror'
 echo "official mc ($mc): $([ $fails = 0 ] && echo ALL PASS || echo "$fails FAILED")"
 exit $((fails > 0))

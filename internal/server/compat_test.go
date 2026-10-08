@@ -56,8 +56,12 @@ func TestSubresourcesDoNotFallThrough(t *testing.T) {
 	if _, err := c.GetObjectRetention(ctx, &s3.GetObjectRetentionInput{Bucket: aws.String("bkt"), Key: aws.String("k")}); errCode(err) != "NotImplemented" {
 		t.Fatalf("GetObjectRetention: want NotImplemented, got %v", err)
 	}
-	if _, err := c.GetObjectLockConfiguration(ctx, &s3.GetObjectLockConfigurationInput{Bucket: aws.String("bkt")}); errCode(err) != "NotImplemented" {
-		t.Fatalf("GetObjectLockConfiguration: want NotImplemented, got %v", err)
+	if _, err := c.PutObjectLockConfiguration(ctx, &s3.PutObjectLockConfigurationInput{Bucket: aws.String("bkt"), ObjectLockConfiguration: &types.ObjectLockConfiguration{ObjectLockEnabled: types.ObjectLockEnabledEnabled}}); errCode(err) != "NotImplemented" {
+		t.Fatalf("PutObjectLockConfiguration: want NotImplemented, got %v", err)
+	}
+	// Reading it is answered as for any bucket without object lock.
+	if _, err := c.GetObjectLockConfiguration(ctx, &s3.GetObjectLockConfigurationInput{Bucket: aws.String("bkt")}); errCode(err) != "ObjectLockConfigurationNotFoundError" {
+		t.Fatalf("GetObjectLockConfiguration: want ObjectLockConfigurationNotFoundError, got %v", err)
 	}
 }
 
@@ -506,6 +510,29 @@ func TestHealthProbes(t *testing.T) {
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("GET %s: %d, want 200", path, resp.StatusCode)
+		}
+	}
+}
+
+// MinIO's ?metadata=true listing extension, which the official mc sends for `diff`, `mirror -a` and
+// `find --metadata`: each object carries <UserMetadata> and <UserTags>.
+func TestListWithMetadata(t *testing.T) {
+	ts, c := newServer(t)
+	mustBucket(t, c, "bkt")
+	put(t, c, &s3.PutObjectInput{Bucket: aws.String("bkt"), Key: aws.String("k"), Body: strings.NewReader("v"),
+		ContentType: aws.String("text/plain"), Metadata: map[string]string{"owner": "me"}, Tagging: aws.String("env=test")})
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/bkt/?list-type=2&fetch-owner=true&metadata=true&encoding-type=url", nil)
+	sigv4.Sign(req, sigv4.Credentials{AccessKey: testAK, SecretKey: testSK}, "us-east-1", time.Now())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	for _, want := range []string{"<UserMetadata><content-type>text/plain</content-type><X-Amz-Meta-Owner>me</X-Amz-Meta-Owner></UserMetadata>", "<UserTags>env=test</UserTags>"} {
+		if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), want) {
+			t.Fatalf("%s: want %s in\n%s", resp.Status, want, body)
 		}
 	}
 }

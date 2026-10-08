@@ -14,8 +14,10 @@ import (
 	"hash/crc64"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -272,6 +274,10 @@ func (s *Server) bucketOp(w http.ResponseWriter, r *http.Request, bucket string,
 			writeACL(w, meta.AllowsAnonymous("s3:GetObject", "arn:aws:s3:::"+bucket+"/*"))
 		case "uploads":
 			s.listUploads(w, r, bucket, q)
+		case "object-lock":
+			// Object lock is never enabled. S3 answers this for such buckets, and mc mirror and the Terraform
+			// AWS provider read it before doing anything else.
+			s.fail(w, r, http.StatusNotFound, "ObjectLockConfigurationNotFoundError", "Object Lock configuration does not exist for this bucket")
 		default:
 			s.notImplemented(w, r)
 		}
@@ -305,6 +311,7 @@ var listParams = map[string]bool{
 	"list-type": true, "prefix": true, "delimiter": true, "marker": true, "max-keys": true, "continuation-token": true,
 	"start-after": true, "fetch-owner": true, "encoding-type": true, "key-marker": true, "version-id-marker": true,
 	"upload-id-marker": true, "max-uploads": true, "max-parts": true, "part-number-marker": true,
+	"metadata": true, // MinIO's extension: user metadata in each listed object (mc diff, mc find --metadata)
 }
 
 // isAuthParam is true for SigV4 (X-Amz-*) and SigV2 presigned query parameters, including the headers
@@ -315,6 +322,30 @@ func isAuthParam(k string) bool {
 		return true
 	}
 	return strings.HasPrefix(k, "X-Amz-") || strings.HasPrefix(k, "x-amz-")
+}
+
+// listMetadata is the <UserMetadata> element MinIO adds to listed objects for ?metadata=true: one child
+// element per header, named after it.
+type listMetadata [][2]string
+
+func newListMetadata(o store.ObjectMeta) *listMetadata {
+	m := listMetadata{{"content-type", o.ContentType}}
+	for _, k := range slices.Sorted(maps.Keys(o.UserMeta)) {
+		m = append(m, [2]string{http.CanonicalHeaderKey("x-amz-meta-" + k), o.UserMeta[k]})
+	}
+	return &m
+}
+
+func (m listMetadata) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	if err := e.EncodeToken(start); err != nil {
+		return err
+	}
+	for _, kv := range m {
+		if err := e.EncodeElement(kv[1], xml.StartElement{Name: xml.Name{Local: kv[0]}}); err != nil {
+			return err
+		}
+	}
+	return e.EncodeToken(start.End())
 }
 
 func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) {
@@ -358,12 +389,24 @@ func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, bucket stri
 		ETag         string
 		Size         int64
 		StorageClass string
-		Owner        *owner `xml:",omitempty"`
+		Owner        *owner        `xml:",omitempty"`
+		UserMetadata *listMetadata `xml:",omitempty"`
+		UserTags     string        `xml:",omitempty"`
 	}
 	type commonPrefix struct{ Prefix string }
+	withMeta := q.Get("metadata") == "true"
 	contents := make([]content, 0, len(res.Objects))
 	for _, o := range res.Objects {
-		contents = append(contents, content{Key: enc(o.Key), LastModified: isoTime(o.LastModified), ETag: o.ETag, Size: o.Size, StorageClass: "STANDARD"})
+		c := content{Key: enc(o.Key), LastModified: isoTime(o.LastModified), ETag: o.ETag, Size: o.Size, StorageClass: "STANDARD"}
+		if withMeta {
+			c.UserMetadata = newListMetadata(o)
+			tags := url.Values{}
+			for k, v := range o.Tags {
+				tags.Set(k, v)
+			}
+			c.UserTags = tags.Encode()
+		}
+		contents = append(contents, c)
 	}
 	prefixes := make([]commonPrefix, 0, len(res.CommonPrefixes))
 	for _, p := range res.CommonPrefixes {

@@ -6,16 +6,15 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 **A drop-in replacement for the `minio/minio` and `minio/mc` images in local dev and CI.**
-It is a small S3-compatible server and an `mc`-compatible CLI in one 10 MB image.
-
-10 MB image, healthy in about 170 ms, 2 MiB of memory at idle. On the same CI runner it handles 2–4× the
-small-object requests per second that MinIO does ([numbers](#numbers)).
+A small S3-compatible server and an `mc`-compatible CLI in one image: 10 MB, healthy in about 170 ms, 2 MiB
+of memory at idle. On the same CI runner it serves 2–4× MinIO's small-object requests per second, and
+1.5–2.4× with fsync on ([numbers](#numbers)).
 
 ## Why
 
 As of October 2026, `docker pull minio/minio` and `docker pull minio/mc` fail: both images are gone from Docker
-Hub, and the upstream repositories are archived. Compose stacks and CI jobs that used MinIO as a stand-in for
-S3 now break at the pull step. ss33 covers the part of MinIO those setups need, and nothing more.
+Hub and Quay, and the upstream repositories are archived. Compose stacks and CI jobs that used MinIO as a
+stand-in for S3 now break at the pull step. ss33 covers the part of MinIO those setups need, and nothing more.
 
 ## Drop-in replacement
 
@@ -65,7 +64,7 @@ There are three things to watch for:
 ## Quick start
 
 ```sh
-docker run -d -p 9000:9000 ghcr.io/midagedev/ss33        # credentials: ss33 / ss33secret
+docker run -d -p 9000:9000 ghcr.io/midagedev/ss33:0.2    # credentials: ss33 / ss33secret
 ```
 
 ```sh
@@ -125,8 +124,9 @@ for ops/s and MiB/s; lower is better for ms. The [Benchmark workflow](.github/wo
 | ListObjectsV2, one prefix page (ms) | 2.0 | **2.0** | 2.4 | 7.4 | 2.0 | 2.1 |
 
 MinIO is built from source (the last published module version, 2026-02-12), since its images are gone. The
-others are their published images with default settings. Only ss33 skips fsync by default; `ss33 --durable`
-is the like-for-like column. Shared runners are noisy: across three runs PUT 4 KiB ranged from 4,716 to
+others are their published images with default settings. MinIO and RustFS fsync before acknowledging a write;
+ss33, SeaweedFS and versitygw do not by default, so `ss33 --durable` is the column to compare with MinIO
+and RustFS. Shared runners are noisy: across three runs PUT 4 KiB ranged from 4,716 to
 7,839 ops/s for ss33, but the ranking did not change.
 
 ### Feature checks
@@ -137,7 +137,7 @@ commonly lean on beyond plain PUT/GET, each driven through aws-sdk-go-v2.
 | Feature | ss33 | MinIO | RustFS 1.0.1 | SeaweedFS 4.48 | versitygw 1.8.0 |
 |---|:-:|:-:|:-:|:-:|:-:|
 | SigV4 presigned GET | ✓ | ✓ | ✓ | ✓ | ✓ |
-| SigV2 presigned GET (boto3's default) | ✓ | ✓ | ✓ | ✓ | ✗ |
+| SigV2 presigned GET (boto3's default in us-east-1) | ✓ | ✓ | ✓ | ✓ | ✗ |
 | Presigned POST (browser form upload) | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Bucket policy: anonymous read | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Object ACL `public-read`: anonymous read² | ✓ | ✗ | ✗ | ✗ | ✗ |
@@ -148,10 +148,10 @@ commonly lean on beyond plain PUT/GET, each driven through aws-sdk-go-v2.
 | UploadPartCopy | ✓ | ✓ | ✓ | ✓ | ✓ |
 | ListMultipartUploads | ✓ | ✓ | ✓ | ✓ | ✓ |
 | ListObjectVersions | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Put/GetBucketVersioning | ✓¹ | ✓ | ✓ | ✓ | ✗ |
+| Put/GetBucketVersioning | ✓¹ | ✓ | ✓ | ✓ | ✗³ |
 | Put/GetBucketCors | ✓¹ | ✗ | ✓ | ✓ | ✓ |
 | Put/GetBucketLifecycleConfiguration | ✓¹ | ✓ | ✓ | ✓ | ✗ |
-| Put/GetBucketEncryption | ✓¹ | ✗ | ✓ | ✓ | ✗ |
+| Put/GetBucketEncryption | ✓¹ | ✗³ | ✓ | ✓ | ✗ |
 | Put/GetBucketTagging | ✓ | ✓ | ✓ | ✓ | ✓ |
 | GetObjectAttributes | ✓ | ✓ | ✓ | ✓ | ✓ |
 
@@ -161,6 +161,10 @@ round-trips, not what a full server does with it.
 
 ² Real S3 disables ACLs on new buckets by default since 2023, and MinIO accepts the header but ignores it.
 ss33 follows the older behaviour so that code written for it still works in tests.
+
+³ Off in the default configuration rather than missing: MinIO's bucket encryption needs a KMS, and
+versitygw's versioning needs a versioning directory. Failure details for every ✗ are in the workflow's
+job summary.
 
 ### Footprint
 
@@ -195,6 +199,16 @@ sleep 10; docker stats --no-stream --format '{{.MemUsage}}' bench   # idle memor
 ```
 
 </details>
+
+## How it works
+
+One Go binary, standard library only. Each object is a plain file named by the SHA-256 of its key, and
+each bucket has an append-only metadata journal that is replayed into memory at startup. There is no
+database, so a PUT costs one data file plus one appended line, and HEAD and LIST never touch the disk.
+GET hands the file to the kernel with `sendfile`. CompleteMultipartUpload moves the part files into
+place instead of concatenating them, and CopyObject hard-links the source where it can. Nothing is fsynced
+unless `--durable` is set; then object data, the journal and directory entries all reach the disk before
+the response.
 
 ## What's supported
 

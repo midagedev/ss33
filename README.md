@@ -109,21 +109,51 @@ for ops/s and MiB/s; lower is better for ms. The [Benchmark workflow](.github/wo
 
 | Test | ss33 | ss33 --durable | MinIO | RustFS 1.0.1 | SeaweedFS 4.48 | versitygw 1.8.0 |
 |---|---:|---:|---:|---:|---:|---:|
-| PUT 4 KiB, 16 concurrent (ops/s) | **4,716** | 2,621 | 1,674 | 964 | 1,986 | 2,162 |
-| GET 4 KiB, 16 concurrent (ops/s) | **7,237** | 7,197 | 3,606 | 4,726 | 3,544 | 2,786 |
-| HEAD, 16 concurrent (ops/s) | 8,617 | **8,659** | 4,366 | 7,002 | 5,172 | 2,958 |
-| PUT 256 MiB, best of 3 (MiB/s) | **283** | 199 | 223 | 181 | 224 | 245 |
-| GET 256 MiB, best of 3 (MiB/s) | **2,228** | 1,809 | 1,643 | 1,443 | 1,388 | 2,200 |
-| UploadPart 32 × 8 MiB, 32 concurrent (MiB/s) | **793** | 563 | 500 | 395 | 341 | 679 |
-| ListParts, 32 parts (ms) | 2.0 | **1.1** | 3.0 | 2.8 | 3.6 | 2.1 |
-| CompleteMultipartUpload, 256 MiB (ms) | 2.3 | **2.2** | 4.7 | 9.7 | 19.0 | 109.6 |
-| PUT 0 B × 20,000, 32 concurrent (ops/s) | **6,099** | 3,033 | 1,618 | 957 | 4,312 | 2,343 |
-| ListObjectsV2, all 20,000 keys (ms) | 544.5 | **303.5** | 747.8 | 3,172.5 | 379.1 | 842.5 |
-| ListObjectsV2, one prefix page (ms) | 1.8 | **1.6** | 3.0 | 9.5 | 2.1 | 3.0 |
+| PUT 4 KiB, 16 concurrent (ops/s) | **7,008** | 3,563 | 2,334 | 1,277 | 1,986 | 3,180 |
+| GET 4 KiB, 16 concurrent (ops/s) | 10,522 | **11,380** | 4,658 | 6,042 | 4,897 | 4,050 |
+| HEAD, 16 concurrent (ops/s) | **13,764** | 13,690 | 5,812 | 9,189 | 6,733 | 4,258 |
+| PUT 256 MiB, best of 3 (MiB/s) | **353** | 154 | 152 | 117 | 240 | 255 |
+| GET 256 MiB, best of 3 (MiB/s) | 3,320 | 3,191 | 1,946 | 1,487 | 1,537 | **3,614** |
+| UploadPart 32 × 8 MiB, 32 concurrent (MiB/s) | **991** | 195 | 193 | 171 | 239 | 700 |
+| ListParts, 32 parts (ms) | **0.7** | 0.9 | 2.0 | 2.5 | 3.3 | 2.1 |
+| CompleteMultipartUpload, 256 MiB (ms) | **1.1** | 2.2 | 3.8 | 8.0 | 15.8 | 114.0 |
+| PUT 0 B × 20,000, 32 concurrent (ops/s) | **9,572** | 3,732 | 2,366 | 1,312 | 5,613 | 3,734 |
+| ListObjectsV2, all 20,000 keys (ms) | 249.5 | **243.8** | 631.2 | 2,478.8 | 324.1 | 526.7 |
+| ListObjectsV2, one prefix page (ms) | 2.0 | **2.0** | 2.4 | 7.4 | 2.0 | 2.1 |
 
 MinIO is built from source (the last published module version, 2026-02-12), since its images are gone. The
 others are their published images with default settings. Only ss33 skips fsync by default; `ss33 --durable`
 is the like-for-like column. Shared runners are noisy, and single runs vary by 20–30 %.
+
+### Feature checks
+
+The same workflow runs [`bench/compat.go`](bench/compat.go) against every server: features that dev stacks
+commonly lean on beyond plain PUT/GET, each driven through aws-sdk-go-v2.
+
+| Feature | ss33 | MinIO | RustFS 1.0.1 | SeaweedFS 4.48 | versitygw 1.8.0 |
+|---|:-:|:-:|:-:|:-:|:-:|
+| SigV4 presigned GET | ✓ | ✓ | ✓ | ✓ | ✓ |
+| SigV2 presigned GET (boto3's default) | ✓ | ✓ | ✓ | ✓ | ✗ |
+| Presigned POST (browser form upload) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Bucket policy: anonymous read | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Object ACL `public-read`: anonymous read | ✓ | ✗ | ✗ | ✗ | ✗ |
+| GetObjectAcl | ✓ | ✓ | ✓ | ✓ | ✗ |
+| Object tagging | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Conditional PUT (`If-None-Match: *`) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| CRC64NVME checksum (AWS CLI v2's default) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| UploadPartCopy | ✓ | ✓ | ✓ | ✓ | ✓ |
+| ListMultipartUploads | ✓ | ✓ | ✓ | ✓ | ✓ |
+| ListObjectVersions | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Put/GetBucketVersioning | ✓¹ | ✓ | ✓ | ✓ | ✗ |
+| Put/GetBucketCors | ✓¹ | ✗ | ✓ | ✓ | ✓ |
+| Put/GetBucketLifecycleConfiguration | ✓¹ | ✓ | ✓ | ✓ | ✗ |
+| Put/GetBucketEncryption | ✓¹ | ✗ | ✓ | ✓ | ✗ |
+| Put/GetBucketTagging | ✓ | ✓ | ✓ | ✓ | ✓ |
+| GetObjectAttributes | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+¹ Stored and returned so bootstrap scripts finish, but not enforced: no old versions are kept, nothing
+expires, nothing is encrypted, and CORS stays open to every origin. The checks test that a call succeeds and
+round-trips, not what a full server does with it.
 
 ### Footprint
 

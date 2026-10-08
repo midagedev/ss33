@@ -22,7 +22,7 @@ Change the two `image:` lines. Leave `command`, `environment` and `healthcheck` 
  services:
    minio:
 -    image: minio/minio
-+    image: ghcr.io/midagedev/ss33:0.1
++    image: ghcr.io/midagedev/ss33:0.2
      command: server /data --console-address ":9001"
      environment:
        MINIO_ROOT_USER: minioadmin
@@ -32,7 +32,7 @@ Change the two `image:` lines. Leave `command`, `environment` and `healthcheck` 
 
    createbuckets:
 -    image: minio/mc
-+    image: ghcr.io/midagedev/ss33:0.1
++    image: ghcr.io/midagedev/ss33:0.2
      depends_on:
        minio:
          condition: service_healthy
@@ -88,7 +88,7 @@ Point SDKs at the endpoint with path-style addressing, for example `forcePathSty
 accepts. In Java, declare the substitution:
 
 ```java
-new MinIOContainer(DockerImageName.parse("ghcr.io/midagedev/ss33:0.1").asCompatibleSubstituteFor("minio/minio"))
+new MinIOContainer(DockerImageName.parse("ghcr.io/midagedev/ss33:0.2").asCompatibleSubstituteFor("minio/minio"))
 ```
 
 In Go, Python and Node, pass the image name where the module takes one.

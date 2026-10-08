@@ -101,6 +101,8 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request, bucket, key 
 			s.fail(w, r, http.StatusForbidden, "InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.")
 		case errors.Is(err, sigv4.ErrExpired):
 			s.fail(w, r, http.StatusForbidden, "AccessDenied", "Request has expired")
+		case errors.Is(err, sigv4.ErrUnsignedHeaders):
+			s.fail(w, r, http.StatusForbidden, "AccessDenied", "There were headers present in the request which were not signed")
 		case errors.Is(err, sigv4.ErrSignatureMismatch):
 			s.fail(w, r, http.StatusForbidden, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided.")
 		default:

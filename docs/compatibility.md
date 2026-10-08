@@ -6,7 +6,7 @@ Anything else answers `501 NotImplemented` with an S3 XML error.
 | Area | Supported |
 | --- | --- |
 | Addressing | Path-style only (`/<bucket>/<key>`) |
-| Auth | SigV4 Authorization header; SigV4 presigned query (expiry enforced); anonymous GET/HEAD on buckets whose policy grants `s3:GetObject` to `*` |
+| Auth | SigV4 Authorization header (unsigned `x-amz-*` headers are rejected, as S3 does); SigV4 presigned query (expiry enforced); anonymous GET/HEAD on buckets whose policy grants `s3:GetObject` to `*` |
 | Service | ListBuckets |
 | Buckets | CreateBucket, HeadBucket, DeleteBucket (must be empty), GetBucketLocation, Get/Put/DeleteBucketPolicy, GetBucketVersioning (always unversioned), ListObjects (v1), ListObjectsV2 (prefix, delimiter, max-keys, continuation-token, start-after, encoding-type=url), DeleteObjects |
 | Objects | PutObject, GetObject (Range, If-None-Match, `response-*` overrides), HeadObject, DeleteObject, CopyObject (COPY/REPLACE metadata directive) |

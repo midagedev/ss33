@@ -38,6 +38,7 @@ var (
 	ErrUnknownAccessKey  = errors.New("unknown access key")
 	ErrSignatureMismatch = errors.New("signature does not match")
 	ErrExpired           = errors.New("request has expired")
+	ErrUnsignedHeaders   = errors.New("there were headers present in the request which were not signed")
 )
 
 // IsPresigned reports whether the request carries query-string authentication.
@@ -113,6 +114,16 @@ func verifyHeader(r *http.Request, auth string, creds Credentials) error {
 	amzDate := r.Header.Get("X-Amz-Date")
 	if amzDate == "" {
 		amzDate = r.Header.Get("Date")
+	}
+	// S3 rejects x-amz-* headers left out of the signature; accepting them would hide client signing bugs.
+	signed := map[string]bool{}
+	for _, h := range p.signedHeaders {
+		signed[h] = true
+	}
+	for name := range r.Header {
+		if lower := strings.ToLower(name); strings.HasPrefix(lower, "x-amz-") && !signed[lower] {
+			return ErrUnsignedHeaders
+		}
 	}
 	payload := r.Header.Get("X-Amz-Content-Sha256")
 	if payload == "" {
@@ -308,21 +319,19 @@ func Sign(req *http.Request, creds Credentials, region string, now time.Time) {
 	if req.Host == "" {
 		req.Host = req.URL.Host
 	}
-	signed := []string{"host", "x-amz-content-sha256", "x-amz-date"}
-	var hb strings.Builder
-	for _, h := range signed {
-		v := req.Host
-		if h != "host" {
-			v = req.Header.Get(h)
+	signed := []string{"host"} // S3 requires every x-amz-* header to be signed (x-amz-copy-source, ...)
+	for name := range req.Header {
+		if lower := strings.ToLower(name); strings.HasPrefix(lower, "x-amz-") {
+			signed = append(signed, lower)
 		}
-		hb.WriteString(h + ":" + v + "\n")
 	}
+	sort.Strings(signed)
 	uri := req.URL.EscapedPath()
 	if uri == "" {
 		uri = "/"
 	}
 	scope := date + "/" + region + "/s3/aws4_request"
-	creq := strings.Join([]string{req.Method, uri, canonicalQuery(req.URL.RawQuery, ""), hb.String(), strings.Join(signed, ";"), UnsignedPayload}, "\n")
+	creq := strings.Join([]string{req.Method, uri, canonicalQuery(req.URL.RawQuery, ""), canonicalHeaders(req, signed), strings.Join(signed, ";"), UnsignedPayload}, "\n")
 	sig := signature(creds.SecretKey, scope, date, amzDate, creq)
 	req.Header.Set("Authorization", fmt.Sprintf("%s Credential=%s/%s, SignedHeaders=%s, Signature=%s",
 		Algorithm, creds.AccessKey, scope, strings.Join(signed, ";"), sig))

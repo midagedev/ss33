@@ -1,7 +1,7 @@
 name: Benchmark
 
-# The same aws-sdk-go-v2 workload (bench/) against ss33 and other S3-compatible servers on one runner.
-# Results land in the job summary and as an artifact.
+# The same aws-sdk-go-v2 workload (bench/) against ss33 and other S3-compatible servers on one runner, then
+# the same feature checks (bench/compat.go). Results land in the job summary and as an artifact.
 on:
   workflow_dispatch:
 
@@ -48,6 +48,7 @@ jobs:
             sleep 3
             echo "::group::$label"
             /tmp/s3bench -ep http://127.0.0.1:9000 -name "$label" -json /tmp/results.jsonl
+            /tmp/s3bench -ep http://127.0.0.1:9000 -name "$label" -json /tmp/results.jsonl -compat
             echo "::endgroup::"
             docker rm -f s3 >/dev/null
           }

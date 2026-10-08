@@ -1,7 +1,9 @@
 // Command bench drives the same S3 workload through aws-sdk-go-v2 against any endpoint, so ss33 and other
 // S3-compatible servers are measured with one client and one set of requests.
 //
-//	go run . -ep http://localhost:9000 -name ss33 [-json results.jsonl]
+//	go run . -ep http://localhost:9000 -name ss33 [-json results.jsonl] [-compat]
+//
+// -compat runs the feature checks in compat.go instead of the timed workload.
 package main
 
 import (
@@ -40,6 +42,7 @@ func main() {
 	sk := flag.String("secret-key", "minioadmin", "secret key")
 	nList := flag.Int("list", 20000, "objects for the listing test")
 	out := flag.String("json", "", "append results as JSON lines to this file")
+	compat := flag.Bool("compat", false, "run the compatibility checks instead of the benchmark")
 	flag.Parse()
 
 	c := s3.New(s3.Options{Region: "us-east-1", BaseEndpoint: ep, UsePathStyle: true,
@@ -61,6 +64,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "create bucket:", err)
 		os.Exit(1)
 	}
+	defer func() { writeResults(*out, results) }()
+	if *compat {
+		for _, check := range compatChecks(c, *ep, *ak, *sk, b) {
+			err := check.fn()
+			record(check.name, 1, "compat", err)
+		}
+		return
+	}
+
 	small := random(4096)
 	key := func(i int) *string { return aws.String(fmt.Sprintf("small/%05d", i)) }
 
@@ -166,18 +178,21 @@ func main() {
 			return err
 		}))
 	}
+}
 
-	if *out != "" {
-		f, err := os.OpenFile(*out, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		defer f.Close()
-		enc := json.NewEncoder(f)
-		for _, r := range results {
-			enc.Encode(r)
-		}
+func writeResults(path string, results []result) {
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	for _, r := range results {
+		enc.Encode(r)
 	}
 }
 

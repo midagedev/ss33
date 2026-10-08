@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -145,5 +146,96 @@ func TestOpensV01Layout(t *testing.T) {
 	defer s.Close()
 	if _, err := s.HeadObject("old", "dir/file.txt"); err != nil {
 		t.Fatalf("after migration: %v", err)
+	}
+}
+
+// A copy reads the source's metadata and links its bytes under one lock: an overwrite racing the copy
+// once left the copy with the old size and ETag over the new bytes.
+func TestCopyRacingOverwriteStaysConsistent(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.CreateBucket("bkt")
+	bodies := []string{strings.Repeat("a", 10), strings.Repeat("b", 20)}
+	putSrc := func(i int) {
+		if _, err := s.PutObject("bkt", ObjectMeta{Key: "src"}, strings.NewReader(bodies[i%2]), Precondition{}); err != nil {
+			t.Error(err)
+		}
+	}
+	putSrc(0)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 2000; i++ {
+			putSrc(i)
+		}
+	}()
+	for i := 0; i < 2000; i++ {
+		if _, err := s.CopyObject("bkt", "src", "bkt", "dst", nil); err != nil {
+			t.Fatal(err)
+		}
+		meta, f, err := s.OpenObject("bkt", "dst")
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := io.ReadAll(f)
+		f.Close()
+		if sum := md5.Sum(data); meta.Size != int64(len(data)) || meta.ETag != `"`+hex.EncodeToString(sum[:])+`"` {
+			t.Fatalf("copy %d: metadata says %d bytes %s, file has %d bytes", i, meta.Size, meta.ETag, len(data))
+		}
+	}
+	<-done
+}
+
+// Copying an object onto itself (to replace its metadata) once left a hard link behind on every call.
+func TestCopyOntoItselfLeavesNoTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.CreateBucket("bkt")
+	s.PutObject("bkt", ObjectMeta{Key: "k"}, strings.NewReader("v"), Precondition{})
+	for i := 0; i < 3; i++ {
+		if _, err := s.CopyObject("bkt", "k", "bkt", "k", &ObjectMeta{ContentType: "text/plain"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "bkt", ".put-*")); len(left) > 0 {
+		t.Fatalf("temp files left behind: %v", left)
+	}
+	if got := string(read(t, s, "bkt", "k")); got != "v" {
+		t.Fatalf("object after self-copy: %q", got)
+	}
+}
+
+// An SDK retry racing the original upload of the same part must leave one part file, the last one written.
+func TestConcurrentPutPartKeepsOneFile(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.CreateBucket("bkt")
+	for round := 0; round < 50; round++ {
+		id, err := s.CreateUpload("bkt", ObjectMeta{Key: "k"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if _, err := s.PutPart("bkt", "k", id, 1, strings.NewReader(strings.Repeat("x", i+1))); err != nil {
+					t.Error(err)
+				}
+			}()
+		}
+		wg.Wait()
+		if files, _ := filepath.Glob(filepath.Join(dir, ".uploads", id, "p00001-*")); len(files) != 1 {
+			t.Fatalf("round %d: %d files for part 1", round, len(files))
+		}
 	}
 }

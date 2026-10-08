@@ -40,6 +40,7 @@ var (
 	ErrSignatureMismatch = errors.New("signature does not match")
 	ErrExpired           = errors.New("request has expired")
 	ErrUnsignedHeaders   = errors.New("there were headers present in the request which were not signed")
+	ErrTimeSkewed        = errors.New("the difference between the request time and the current time is too large")
 )
 
 // IsPresigned reports whether the request carries query-string authentication.
@@ -65,8 +66,12 @@ func Verify(r *http.Request, creds Credentials, now time.Time) error {
 	if auth == "" {
 		return ErrMissingAuth
 	}
-	return verifyHeader(r, auth, creds)
+	return verifyHeader(r, auth, creds, now)
 }
+
+// maxSkew is how far a header-signed request's time may be from the server's, as in S3: it bounds how long
+// a captured Authorization header can be replayed.
+const maxSkew = 15 * time.Minute
 
 type parsedAuth struct {
 	accessKey     string
@@ -88,7 +93,7 @@ func parseCredential(cred string) (accessKey, scope, date string, err error) {
 	return parts[0], parts[1], scopeParts[0], nil
 }
 
-func verifyHeader(r *http.Request, auth string, creds Credentials) error {
+func verifyHeader(r *http.Request, auth string, creds Credentials, now time.Time) error {
 	if !strings.HasPrefix(auth, Algorithm+" ") {
 		return ErrMalformed
 	}
@@ -119,6 +124,15 @@ func verifyHeader(r *http.Request, auth string, creds Credentials) error {
 	amzDate := r.Header.Get("X-Amz-Date")
 	if amzDate == "" {
 		amzDate = r.Header.Get("Date")
+	}
+	signedAt, err := time.Parse(TimeFormat, amzDate)
+	if err != nil {
+		if signedAt, err = http.ParseTime(amzDate); err != nil {
+			return ErrMalformed
+		}
+	}
+	if d := now.Sub(signedAt); d > maxSkew || d < -maxSkew {
+		return ErrTimeSkewed
 	}
 	// S3 rejects x-amz-* headers left out of the signature; accepting them would hide client signing bugs.
 	signed := map[string]bool{}
@@ -218,20 +232,29 @@ func signature(secret, scope, date, amzDate, canonicalRequest string) string {
 }
 
 // signingKeys caches derived keys: they change once a day per secret and region, but deriving one costs
-// four HMACs on every request.
-var signingKeys sync.Map // secret + "\x00" + scope -> []byte
+// four HMACs on every request. The scope comes from the client before its signature is checked, so the
+// cache is emptied once it grows past what legitimate traffic produces.
+var (
+	signingKeysMu sync.Mutex
+	signingKeys   = map[string][]byte{} // secret + "\x00" + scope -> key
+)
 
 func signingKey(secret, scope, date string) []byte {
 	id := secret + "\x00" + scope
-	if k, ok := signingKeys.Load(id); ok {
-		return k.([]byte)
+	signingKeysMu.Lock()
+	defer signingKeysMu.Unlock()
+	if k, ok := signingKeys[id]; ok {
+		return k
+	}
+	if len(signingKeys) >= 64 {
+		clear(signingKeys)
 	}
 	scopeParts := strings.Split(scope, "/")
 	key := hmacSHA256([]byte("AWS4"+secret), date)
 	key = hmacSHA256(key, scopeParts[1])
 	key = hmacSHA256(key, scopeParts[2])
 	key = hmacSHA256(key, "aws4_request")
-	signingKeys.Store(id, key)
+	signingKeys[id] = key
 	return key
 }
 

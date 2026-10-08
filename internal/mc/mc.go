@@ -335,11 +335,16 @@ func (t target) setAnonymous(mode string) error {
 	case "none", "private":
 		return t.call(http.MethodDelete, "", url.Values{"policy": {""}}, nil, 0, nil, http.StatusNoContent, http.StatusOK)
 	case "download", "public":
-		actions := `"s3:GetObject"`
+		// The statements the official mc writes for these modes.
+		bucketActions, objectActions := `"s3:GetBucketLocation","s3:ListBucket"`, `"s3:GetObject"`
 		if mode == "public" {
-			actions = `"s3:GetObject","s3:PutObject","s3:DeleteObject"`
+			bucketActions += `,"s3:ListBucketMultipartUploads"`
+			objectActions = `"s3:AbortMultipartUpload","s3:DeleteObject","s3:GetObject","s3:ListMultipartUploadParts","s3:PutObject"`
 		}
-		policy := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["*"]},"Action":[%s],"Resource":["arn:aws:s3:::%s/*"]}]}`, actions, t.bucket)
+		policy := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[`+
+			`{"Effect":"Allow","Principal":{"AWS":["*"]},"Action":[%s],"Resource":["arn:aws:s3:::%s"]},`+
+			`{"Effect":"Allow","Principal":{"AWS":["*"]},"Action":[%s],"Resource":["arn:aws:s3:::%s/*"]}]}`,
+			bucketActions, t.bucket, objectActions, t.bucket)
 		return t.call(http.MethodPut, "", url.Values{"policy": {""}}, strings.NewReader(policy), int64(len(policy)), nil, http.StatusNoContent, http.StatusOK)
 	}
 	return fmt.Errorf("unsupported anonymous mode %q", mode)
@@ -515,8 +520,11 @@ func (c config) copy(src, dst string, recursive bool, stdout io.Writer, quiet bo
 			return st.download(st.key, out)
 		}
 		return st.walk(true, func(o listedObject, _ bool) error {
-			rel := strings.TrimPrefix(strings.TrimPrefix(o.Key, st.key), "/")
-			return st.download(o.Key, filepath.Join(dst, filepath.FromSlash(rel)))
+			rel := filepath.FromSlash(strings.TrimPrefix(strings.TrimPrefix(o.Key, st.key), "/"))
+			if !filepath.IsLocal(rel) {
+				return fmt.Errorf("refusing to write key %q outside %s", o.Key, dst) // e.g. "../x"
+			}
+			return st.download(o.Key, filepath.Join(dst, rel))
 		})
 	}
 	return errors.New("local to local copy is not supported")

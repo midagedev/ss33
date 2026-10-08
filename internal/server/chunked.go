@@ -54,12 +54,12 @@ func (c *chunkedReader) Read(p []byte) (int, error) {
 	if c.remaining == 0 {
 		line, err := c.r.ReadString('\n')
 		if err != nil {
-			return 0, fmt.Errorf("aws-chunked: reading chunk header: %w", err)
+			return 0, fmt.Errorf("%w: reading chunk header: %v", errIncompleteBody, err)
 		}
 		sizeHex, _, _ := strings.Cut(strings.TrimRight(line, "\r\n"), ";")
 		size, err := strconv.ParseInt(strings.TrimSpace(sizeHex), 16, 64)
-		if err != nil {
-			return 0, fmt.Errorf("aws-chunked: bad chunk size %q", sizeHex)
+		if err != nil || size < 0 {
+			return 0, fmt.Errorf("%w: bad chunk size %q", errIncompleteBody, sizeHex)
 		}
 		if size == 0 {
 			c.done = true
@@ -81,7 +81,7 @@ func (c *chunkedReader) Read(p []byte) (int, error) {
 	c.remaining -= int64(n)
 	if c.remaining == 0 && err == nil {
 		if _, err := c.r.Discard(2); err != nil { // CRLF after the chunk data
-			return n, fmt.Errorf("aws-chunked: missing chunk terminator: %w", err)
+			return n, fmt.Errorf("%w: missing chunk terminator: %v", errIncompleteBody, err)
 		}
 	}
 	if err == io.EOF && !c.done {

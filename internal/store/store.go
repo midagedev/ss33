@@ -70,13 +70,6 @@ type BucketMeta struct {
 	Configs map[string]string `json:"configs,omitempty"` // subresource (cors, lifecycle, ...) -> XML as the client sent it
 }
 
-// PublicRead reports whether the bucket policy grants anonymous s3:GetObject — what `mc anonymous set
-// download` writes.
-func (b BucketMeta) PublicRead() bool {
-	return b.Policy != "" && strings.Contains(b.Policy, "s3:GetObject") &&
-		(strings.Contains(b.Policy, `"*"`) || strings.Contains(b.Policy, `"AWS":["*"]`))
-}
-
 type Store struct {
 	// Durable fsyncs object data, the journal and directory entries before a write is acknowledged.
 	Durable bool
@@ -452,6 +445,11 @@ func (s *Store) unlinkData(base string, m ObjectMeta) (garbage string) {
 func (s *Store) HeadObject(bucketName, key string) (ObjectMeta, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.head(bucketName, key)
+}
+
+// head looks up an object's metadata. Callers hold s.mu.
+func (s *Store) head(bucketName, key string) (ObjectMeta, error) {
 	b, ok := s.buckets[bucketName]
 	if !ok {
 		return ObjectMeta{}, ErrNoSuchBucket
@@ -552,11 +550,17 @@ func (s *Store) DeleteObject(bucketName, key string) error {
 // CopyObject copies an object server-side. When replace is nil the source metadata is kept (COPY
 // directive). A single-file source is hard-linked, so the copy costs no data I/O.
 func (s *Store) CopyObject(srcBucket, srcKey, dstBucket, dstKey string, replace *ObjectMeta) (ObjectMeta, error) {
-	src, err := s.HeadObject(srcBucket, srcKey)
-	if err != nil {
+	if _, err := s.Bucket(dstBucket); err != nil {
 		return ObjectMeta{}, err
 	}
-	if _, err := s.Bucket(dstBucket); err != nil {
+	// The metadata and the link are taken under one read lock, so an overwrite in between cannot pair
+	// the old size and ETag with the new bytes.
+	tmp := filepath.Join(s.bucketDir(dstBucket), ".put-"+randomID())
+	s.mu.RLock()
+	src, err := s.head(srcBucket, srcKey)
+	linked := err == nil && src.Parts == nil && os.Link(objectBase(s.bucketDir(srcBucket), srcKey)+".bin", tmp) == nil
+	s.mu.RUnlock()
+	if err != nil {
 		return ObjectMeta{}, err
 	}
 	meta := src
@@ -564,16 +568,13 @@ func (s *Store) CopyObject(srcBucket, srcKey, dstBucket, dstKey string, replace 
 		meta = *replace
 	}
 	meta.Key = dstKey
-	if src.Parts == nil {
-		tmp := filepath.Join(s.bucketDir(dstBucket), ".put-"+randomID())
-		if os.Link(objectBase(s.bucketDir(srcBucket), srcKey)+".bin", tmp) == nil {
-			meta.Size, meta.ETag, meta.Parts = src.Size, src.ETag, nil
-			out, err := s.publish(dstBucket, meta, tmp, Precondition{})
-			if err != nil {
-				os.Remove(tmp)
-			}
-			return out, err
-		}
+	if linked {
+		meta.Size, meta.ETag, meta.Parts = src.Size, src.ETag, nil
+		out, err := s.publish(dstBucket, meta, tmp, Precondition{})
+		// Renaming a hard link onto the file it already names (a copy onto itself) succeeds without moving
+		// anything, so the link can still be here.
+		os.Remove(tmp)
+		return out, err
 	}
 	_, f, err := s.OpenObject(srcBucket, srcKey)
 	if err != nil {
@@ -738,12 +739,16 @@ func (s *Store) PutPart(bucketName, key, id string, number int, body io.Reader) 
 	}
 	sum := hex.EncodeToString(h.Sum(nil))
 	prefix := fmt.Sprintf("p%05d-", number)
-	if old, _ := filepath.Glob(filepath.Join(dir, prefix+"*")); len(old) > 0 {
-		for _, p := range old {
-			os.Remove(p)
-		}
+	// Replacing a part is a glob, removes and a rename; the lock keeps two uploads of the same part
+	// number (an SDK retry racing the original) from both surviving.
+	s.mu.Lock()
+	old, _ := filepath.Glob(filepath.Join(dir, prefix+"*"))
+	for _, p := range old {
+		os.Remove(p)
 	}
-	if err := os.Rename(f.Name(), filepath.Join(dir, prefix+sum)); err != nil {
+	err = os.Rename(f.Name(), filepath.Join(dir, prefix+sum))
+	s.mu.Unlock()
+	if err != nil {
 		return "", err
 	}
 	return `"` + sum + `"`, s.syncDir(dir)

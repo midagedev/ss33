@@ -110,3 +110,24 @@ func TestAliasFromEnvAndConfigHost(t *testing.T) {
 		t.Fatalf("buckets: %+v", b)
 	}
 }
+
+// A key such as "../x" must not let a recursive download write outside the destination directory.
+func TestRecursiveDownloadStaysInDestination(t *testing.T) {
+	st, _ := store.Open(t.TempDir())
+	ts := httptest.NewServer(&server.Server{Store: st, Creds: sigv4.Credentials{AccessKey: "admin", SecretKey: "admin-secret"}, Region: "us-east-1"})
+	defer ts.Close()
+	t.Setenv("MC_CONFIG_DIR", t.TempDir())
+	st.CreateBucket("bkt")
+	st.PutObject("bkt", store.ObjectMeta{Key: "../../escaped.txt"}, strings.NewReader("x"), store.Precondition{})
+
+	root := t.TempDir()
+	dst := filepath.Join(root, "a", "dst")
+	mc.Main([]string{"alias", "set", "local", ts.URL, "admin", "admin-secret"}, &bytes.Buffer{}, &bytes.Buffer{})
+	var errOut bytes.Buffer
+	if code := mc.Main([]string{"cp", "--recursive", "local/bkt", dst}, &bytes.Buffer{}, &errOut); code == 0 {
+		t.Fatal("cp --recursive accepted a key that leaves the destination")
+	}
+	if _, err := os.Stat(filepath.Join(root, "escaped.txt")); err == nil {
+		t.Fatal("file written outside the destination")
+	}
+}

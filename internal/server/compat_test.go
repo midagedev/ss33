@@ -494,3 +494,18 @@ func TestGetObjectAttributes(t *testing.T) {
 		t.Fatalf("GetObjectAttributes parts: %v %+v", err, out.ObjectParts)
 	}
 }
+
+// Health probes answer without credentials, under every path MinIO tooling polls.
+func TestHealthProbes(t *testing.T) {
+	ts, _ := newServer(t)
+	for _, path := range []string{"/minio/health/live", "/minio/health/ready", "/minio/health/cluster", "/minio/health/cluster/read", "/healthz"} {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s: %d, want 200", path, resp.StatusCode)
+		}
+	}
+}

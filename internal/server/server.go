@@ -61,7 +61,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch r.URL.Path {
-	case "/minio/health/live", "/minio/health/ready", "/healthz":
+	// The cluster probes are what the official `mc ready` and Kubernetes charts poll.
+	case "/minio/health/live", "/minio/health/ready", "/minio/health/cluster", "/minio/health/cluster/read", "/healthz":
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -106,6 +107,8 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request, bucket, key 
 			s.fail(w, r, http.StatusForbidden, "InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.")
 		case errors.Is(err, sigv4.ErrExpired):
 			s.fail(w, r, http.StatusForbidden, "AccessDenied", "Request has expired")
+		case errors.Is(err, sigv4.ErrTimeSkewed):
+			s.fail(w, r, http.StatusForbidden, "RequestTimeTooSkewed", "The difference between the request time and the current time is too large.")
 		case errors.Is(err, sigv4.ErrUnsignedHeaders):
 			s.fail(w, r, http.StatusForbidden, "AccessDenied", "There were headers present in the request which were not signed")
 		case errors.Is(err, sigv4.ErrSignatureMismatch):
@@ -115,11 +118,14 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request, bucket, key 
 		}
 		return false
 	}
-	if bucket != "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		if meta, err := s.Store.Bucket(bucket); err == nil && meta.PublicRead() {
-			return true
+	if bucket != "" {
+		sub := subresource(r.URL.Query())
+		if action, resource := anonymousAction(r, bucket, key, sub); action != "" {
+			if meta, err := s.Store.Bucket(bucket); err == nil && meta.AllowsAnonymous(action, resource) {
+				return true
+			}
 		}
-		if key != "" && subresource(r.URL.Query()) == "" {
+		if key != "" && sub == "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 			if m, err := s.Store.HeadObject(bucket, key); err == nil && m.Public {
 				return true
 			}
@@ -127,6 +133,26 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request, bucket, key 
 	}
 	s.fail(w, r, http.StatusForbidden, "AccessDenied", "Access Denied.")
 	return false
+}
+
+// anonymousAction is the policy action an unauthenticated request needs, or "" when only a signed request
+// may make it.
+func anonymousAction(r *http.Request, bucket, key, sub string) (action, resource string) {
+	read := r.Method == http.MethodGet || r.Method == http.MethodHead
+	object := "arn:aws:s3:::" + bucket + "/" + key
+	switch {
+	case key != "" && sub == "" && read:
+		return "s3:GetObject", object
+	case key != "" && sub == "" && r.Method == http.MethodPut && r.Header.Get("X-Amz-Copy-Source") == "":
+		return "s3:PutObject", object
+	case key != "" && sub == "" && r.Method == http.MethodDelete:
+		return "s3:DeleteObject", object
+	case key == "" && sub == "" && read:
+		return "s3:ListBucket", "arn:aws:s3:::" + bucket // ListObjects and HeadBucket
+	case key == "" && sub == "location" && read:
+		return "s3:GetBucketLocation", "arn:aws:s3:::" + bucket
+	}
+	return "", ""
 }
 
 // cors answers every origin. Browsers reach ss33 through presigned URLs from a page on another origin;
@@ -243,7 +269,7 @@ func (s *Server) bucketOp(w http.ResponseWriter, r *http.Request, bucket string,
 			w.Header().Set("Content-Type", "application/xml")
 			io.WriteString(w, cfg)
 		case "acl":
-			writeACL(w, meta.PublicRead())
+			writeACL(w, meta.AllowsAnonymous("s3:GetObject", "arn:aws:s3:::"+bucket+"/*"))
 		case "uploads":
 			s.listUploads(w, r, bucket, q)
 		default:
@@ -886,8 +912,9 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request, bucket, 
 			ETag       string
 		} `xml:"Part"`
 	}
-	if err := xml.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(&req); err != nil {
-		s.fail(w, r, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed")
+	// S3 refuses a completion without parts as malformed; storing one would leave an object with no bytes.
+	if err := xml.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(&req); err != nil || len(req.Parts) == 0 {
+		s.fail(w, r, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema")
 		return
 	}
 	parts := make([]store.Part, len(req.Parts))
@@ -1042,7 +1069,11 @@ var storeErrors = map[error]struct {
 	store.ErrInvalidPart:      {http.StatusBadRequest, "One or more of the specified parts could not be found."},
 	store.ErrInvalidPartOrder: {http.StatusBadRequest, "The list of parts was not in ascending order."},
 	store.ErrPrecondition:     {http.StatusPreconditionFailed, "At least one of the pre-conditions you specified did not hold"},
+	errIncompleteBody:         {http.StatusBadRequest, "The request body is not valid aws-chunked encoding."},
 }
+
+// errIncompleteBody is a malformed aws-chunked body; its text is the S3 error code.
+var errIncompleteBody = errors.New("IncompleteBody")
 
 func (s *Server) storeErr(w http.ResponseWriter, r *http.Request, err error) {
 	for known, e := range storeErrors {

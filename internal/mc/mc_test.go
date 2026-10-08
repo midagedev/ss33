@@ -76,3 +76,26 @@ func TestBootstrapScript(t *testing.T) {
 		t.Fatal("mb without --ignore-existing on an existing bucket should fail")
 	}
 }
+
+// Aliases also come from MC_HOST_<alias> and the pre-2021 `mc config host add`.
+func TestAliasFromEnvAndConfigHost(t *testing.T) {
+	st, _ := store.Open(t.TempDir())
+	ts := httptest.NewServer(&server.Server{Store: st, Creds: sigv4.Credentials{AccessKey: "admin", SecretKey: "admin-secret"}, Region: "us-east-1"})
+	defer ts.Close()
+	t.Setenv("MC_CONFIG_DIR", t.TempDir())
+	t.Setenv("MC_HOST_fromenv", strings.Replace(ts.URL, "http://", "http://admin:admin-secret@", 1))
+
+	for _, args := range [][]string{
+		{"mb", "fromenv/one"},
+		{"config", "host", "add", "legacy", ts.URL, "admin", "admin-secret"},
+		{"mb", "legacy/two"},
+	} {
+		var errOut bytes.Buffer
+		if code := mc.Main(args, &bytes.Buffer{}, &errOut); code != 0 {
+			t.Fatalf("mc %v: %s", args, errOut.String())
+		}
+	}
+	if b := st.ListBuckets(); len(b) != 2 {
+		t.Fatalf("buckets: %+v", b)
+	}
+}

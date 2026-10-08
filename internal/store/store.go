@@ -45,6 +45,7 @@ var (
 	ErrNoSuchUpload     = errors.New("NoSuchUpload")
 	ErrInvalidPart      = errors.New("InvalidPart")
 	ErrInvalidPartOrder = errors.New("InvalidPartOrder")
+	ErrPrecondition     = errors.New("PreconditionFailed")
 )
 
 var bucketNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
@@ -58,12 +59,15 @@ type ObjectMeta struct {
 	Headers      map[string]string `json:"headers,omitempty"`  // Content-Disposition, Cache-Control, ...
 	UserMeta     map[string]string `json:"userMeta,omitempty"` // x-amz-meta-* without the prefix, lowercased
 	Parts        []int64           `json:"parts,omitempty"`    // part sizes when the bytes live in <hash>.parts/
+	Tags         map[string]string `json:"tags,omitempty"`
+	Public       bool              `json:"public,omitempty"` // canned ACL public-read: anonymous GET allowed
 }
 
 type BucketMeta struct {
-	Name    string    `json:"name"`
-	Created time.Time `json:"created"`
-	Policy  string    `json:"policy,omitempty"`
+	Name    string            `json:"name"`
+	Created time.Time         `json:"created"`
+	Policy  string            `json:"policy,omitempty"`
+	Configs map[string]string `json:"configs,omitempty"` // subresource (cors, lifecycle, ...) -> XML as the client sent it
 }
 
 // PublicRead reports whether the bucket policy grants anonymous s3:GetObject — what `mc anonymous set
@@ -327,20 +331,37 @@ func (s *Store) ListBuckets() []BucketMeta {
 	return out
 }
 
-func (s *Store) SetPolicy(name, policy string) error {
+// UpdateBucket changes bucket metadata (policy, configurations) and persists it.
+func (s *Store) UpdateBucket(name string, update func(*BucketMeta)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b, ok := s.buckets[name]
 	if !ok {
 		return ErrNoSuchBucket
 	}
-	b.meta.Policy = policy
+	update(&b.meta)
 	return s.writeJSON(filepath.Join(s.bucketDir(name), ".bucket.json"), b.meta)
 }
 
+// Precondition guards a write against the object it replaces: If-Match (an ETag) and If-None-Match ("*").
+type Precondition struct{ IfMatch, IfNoneMatch string }
+
+func (p Precondition) check(old ObjectMeta, exists bool) error {
+	switch {
+	case p.IfNoneMatch != "" && exists:
+		return ErrPrecondition
+	case p.IfMatch != "" && !exists:
+		return ErrNoSuchKey
+	case p.IfMatch != "" && p.IfMatch != "*" && strings.Trim(p.IfMatch, `"`) != strings.Trim(old.ETag, `"`):
+		return ErrPrecondition
+	}
+	return nil
+}
+
 // PutObject streams body to disk, then publishes the metadata. meta.Key/ContentType/Headers/UserMeta come
-// from the caller; size, ETag and LastModified are computed here.
-func (s *Store) PutObject(bucketName string, meta ObjectMeta, body io.Reader) (ObjectMeta, error) {
+// from the caller; size, ETag and LastModified are computed here. cond is checked when the object is
+// published, under the same lock, so two conditional writers cannot both win.
+func (s *Store) PutObject(bucketName string, meta ObjectMeta, body io.Reader, cond Precondition) (ObjectMeta, error) {
 	if _, err := s.Bucket(bucketName); err != nil {
 		return ObjectMeta{}, err
 	}
@@ -363,7 +384,7 @@ func (s *Store) PutObject(bucketName string, meta ObjectMeta, body io.Reader) (O
 	meta.Size = n
 	meta.ETag = `"` + hex.EncodeToString(h.Sum(nil)) + `"`
 	meta.Parts = nil
-	out, err := s.publish(bucketName, meta, tmp.Name())
+	out, err := s.publish(bucketName, meta, tmp.Name(), cond)
 	if err != nil {
 		os.Remove(tmp.Name())
 	}
@@ -372,7 +393,7 @@ func (s *Store) PutObject(bucketName string, meta ObjectMeta, body io.Reader) (O
 
 // publish moves data (a file, or a directory of parts when meta.Parts is set) into place and journals meta.
 // The lock covers only renames and one append; whatever the new version replaces is deleted afterwards.
-func (s *Store) publish(bucketName string, meta ObjectMeta, data string) (ObjectMeta, error) {
+func (s *Store) publish(bucketName string, meta ObjectMeta, data string, cond Precondition) (ObjectMeta, error) {
 	meta.LastModified = time.Now().UTC().Truncate(time.Millisecond)
 	line, err := journalLine(record{Put: &meta})
 	if err != nil {
@@ -384,9 +405,14 @@ func (s *Store) publish(bucketName string, meta ObjectMeta, data string) (Object
 		s.mu.Unlock()
 		return ObjectMeta{}, ErrNoSuchBucket
 	}
+	old, exists := b.objects[meta.Key]
+	if err := cond.check(old, exists); err != nil {
+		s.mu.Unlock()
+		return ObjectMeta{}, err
+	}
 	base := objectBase(s.bucketDir(bucketName), meta.Key)
 	var garbage string
-	if old, ok := b.objects[meta.Key]; ok && (old.Parts != nil || meta.Parts != nil) {
+	if exists && (old.Parts != nil || meta.Parts != nil) {
 		garbage = s.unlinkData(base, old) // a file-over-file rename replaces atomically on its own
 	}
 	target := base + ".bin"
@@ -465,6 +491,34 @@ func (s *Store) OpenObject(bucketName, key string) (ObjectMeta, Object, error) {
 	return m, pr, err
 }
 
+// UpdateObject rewrites an object's metadata (tags, ACL) without touching its bytes.
+func (s *Store) UpdateObject(bucketName, key string, update func(*ObjectMeta)) error {
+	s.mu.Lock()
+	b, ok := s.buckets[bucketName]
+	if !ok {
+		s.mu.Unlock()
+		return ErrNoSuchBucket
+	}
+	m, ok := b.objects[key]
+	if !ok {
+		s.mu.Unlock()
+		return ErrNoSuchKey
+	}
+	update(&m)
+	line, err := journalLine(record{Put: &m})
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	log, err := s.appendRecord(bucketName, b, line)
+	b.objects[key] = m
+	s.mu.Unlock()
+	if err == nil {
+		err = s.commit(log, s.bucketDir(bucketName))
+	}
+	return err
+}
+
 // DeleteObject is idempotent like S3: deleting a missing key succeeds.
 func (s *Store) DeleteObject(bucketName, key string) error {
 	line, err := journalLine(record{Del: key})
@@ -514,7 +568,7 @@ func (s *Store) CopyObject(srcBucket, srcKey, dstBucket, dstKey string, replace 
 		tmp := filepath.Join(s.bucketDir(dstBucket), ".put-"+randomID())
 		if os.Link(objectBase(s.bucketDir(srcBucket), srcKey)+".bin", tmp) == nil {
 			meta.Size, meta.ETag, meta.Parts = src.Size, src.ETag, nil
-			out, err := s.publish(dstBucket, meta, tmp)
+			out, err := s.publish(dstBucket, meta, tmp, Precondition{})
 			if err != nil {
 				os.Remove(tmp)
 			}
@@ -526,7 +580,7 @@ func (s *Store) CopyObject(srcBucket, srcKey, dstBucket, dstKey string, replace 
 		return ObjectMeta{}, err
 	}
 	defer f.Close()
-	return s.PutObject(dstBucket, meta, f)
+	return s.PutObject(dstBucket, meta, f, Precondition{})
 }
 
 type ListResult struct {
@@ -613,6 +667,40 @@ func (s *Store) CreateUpload(bucketName string, meta ObjectMeta) (string, error)
 		return "", err
 	}
 	return id, s.writeJSON(filepath.Join(s.uploadDir(id), "upload.json"), upload{Bucket: bucketName, Meta: meta, Created: time.Now().UTC()})
+}
+
+// Upload is an in-progress multipart upload as ListMultipartUploads reports it.
+type Upload struct {
+	ID      string
+	Key     string
+	Created time.Time
+}
+
+// ListUploads returns a bucket's in-progress uploads under prefix, by key then start time.
+// ponytail: reads every upload.json on each call; index them in memory if a test keeps thousands open.
+func (s *Store) ListUploads(bucketName, prefix string) ([]Upload, error) {
+	if _, err := s.Bucket(bucketName); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(filepath.Join(s.root, ".uploads"))
+	if err != nil {
+		return nil, err
+	}
+	var out []Upload
+	for _, e := range entries {
+		var u upload
+		if readJSON(filepath.Join(s.uploadDir(e.Name()), "upload.json"), &u) != nil || u.Bucket != bucketName || !strings.HasPrefix(u.Meta.Key, prefix) {
+			continue
+		}
+		out = append(out, Upload{ID: e.Name(), Key: u.Meta.Key, Created: u.Created})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Key != out[j].Key {
+			return out[i].Key < out[j].Key
+		}
+		return out[i].Created.Before(out[j].Created)
+	})
+	return out, nil
 }
 
 func (s *Store) loadUpload(bucketName, key, id string) (upload, error) {
@@ -750,7 +838,7 @@ func (s *Store) CompleteUpload(bucketName, key, id string, requested []Part) (Ob
 		return ObjectMeta{}, err
 	}
 	meta.ETag = fmt.Sprintf(`"%s-%d"`, hex.EncodeToString(etags.Sum(nil)), len(requested))
-	out, err := s.publish(bucketName, meta, dir)
+	out, err := s.publish(bucketName, meta, dir, Precondition{})
 	if err != nil {
 		os.RemoveAll(dir)
 		return ObjectMeta{}, err

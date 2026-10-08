@@ -48,6 +48,19 @@ func loadConfig() config {
 	if c.Aliases == nil {
 		c.Aliases = map[string]alias{}
 	}
+	// MC_HOST_<alias>=http://ACCESS:SECRET@host:port defines an alias without `mc alias set`.
+	for _, kv := range os.Environ() {
+		name, raw, _ := strings.Cut(kv, "=")
+		if !strings.HasPrefix(name, "MC_HOST_") {
+			continue
+		}
+		u, err := url.Parse(raw)
+		if err != nil || u.User == nil {
+			continue
+		}
+		secret, _ := u.User.Password()
+		c.Aliases[strings.TrimPrefix(name, "MC_HOST_")] = alias{URL: u.Scheme + "://" + u.Host, AccessKey: u.User.Username(), SecretKey: secret}
+	}
 	return c
 }
 
@@ -91,6 +104,12 @@ func run(args []string, stdout io.Writer) error {
 	}
 	cfg := loadConfig()
 	f, pos := parseArgs(args[1:])
+	if args[0] == "config" && len(pos) > 0 && pos[0] == "host" { // mc config host add: the pre-2021 spelling
+		args, pos = []string{"alias"}, pos[1:]
+		if len(pos) > 0 && pos[0] == "add" {
+			pos[0] = "set"
+		}
+	}
 	switch args[0] {
 	case "alias":
 		if len(pos) == 5 && pos[0] == "set" {

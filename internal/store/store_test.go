@@ -40,7 +40,7 @@ func TestReopenRestoresState(t *testing.T) {
 				t.Fatal(err)
 			}
 			put := func(key, body string) {
-				if _, err := s.PutObject("bkt", ObjectMeta{Key: key}, strings.NewReader(body)); err != nil {
+				if _, err := s.PutObject("bkt", ObjectMeta{Key: key}, strings.NewReader(body), Precondition{}); err != nil {
 					t.Fatal(err)
 				}
 			}

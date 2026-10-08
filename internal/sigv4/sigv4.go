@@ -47,15 +47,19 @@ func IsPresigned(r *http.Request) bool {
 	return r.URL.Query().Get("X-Amz-Algorithm") != ""
 }
 
-// HasAuth reports whether the request carries any SigV4 authentication.
+// HasAuth reports whether the request carries any authentication: a SigV4 header or presigned query, or a
+// SigV2 presigned query.
 func HasAuth(r *http.Request) bool {
-	return r.Header.Get("Authorization") != "" || IsPresigned(r)
+	return r.Header.Get("Authorization") != "" || IsPresigned(r) || IsPresignedV2(r)
 }
 
 // Verify checks the request signature against creds. now is injectable for tests.
 func Verify(r *http.Request, creds Credentials, now time.Time) error {
 	if IsPresigned(r) {
 		return verifyPresigned(r, creds, now)
+	}
+	if IsPresignedV2(r) {
+		return verifyPresignedV2(r, creds, now)
 	}
 	auth := r.Header.Get("Authorization")
 	if auth == "" {

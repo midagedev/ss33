@@ -242,15 +242,36 @@ func TestMultipartAndCopy(t *testing.T) {
 		t.Fatal("copied object differs")
 	}
 
-	// UploadPartCopy is unsupported: it must fail loudly, not store the empty request body as the part.
+	// UploadPartCopy: two ranges of the multipart source become a new two-part object.
 	mp, err := c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String("other"), Key: aws.String("partcopy.bin")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = c.UploadPartCopy(ctx, &s3.UploadPartCopyInput{Bucket: aws.String("other"), Key: aws.String("partcopy.bin"),
-		UploadId: mp.UploadId, PartNumber: aws.Int32(1), CopySource: aws.String("bkt/big.bin")})
-	if errCode(err) != "NotImplemented" {
-		t.Fatalf("UploadPartCopy: want NotImplemented, got %v", err)
+	var parts []types.CompletedPart
+	for i, rng := range []string{"bytes=0-5242879", fmt.Sprintf("bytes=5242880-%d", len(payload)-1)} {
+		out, err := c.UploadPartCopy(ctx, &s3.UploadPartCopyInput{Bucket: aws.String("other"), Key: aws.String("partcopy.bin"),
+			UploadId: mp.UploadId, PartNumber: aws.Int32(int32(i + 1)), CopySource: aws.String("bkt/big.bin"), CopySourceRange: aws.String(rng)})
+		if err != nil {
+			t.Fatalf("UploadPartCopy %s: %v", rng, err)
+		}
+		parts = append(parts, types.CompletedPart{PartNumber: aws.Int32(int32(i + 1)), ETag: out.CopyPartResult.ETag})
+	}
+	if _, err := c.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: aws.String("other"), Key: aws.String("partcopy.bin"),
+		UploadId: mp.UploadId, MultipartUpload: &types.CompletedMultipartUpload{Parts: parts}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("other"), Key: aws.String("partcopy.bin")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ = io.ReadAll(got.Body)
+	got.Body.Close()
+	if !bytes.Equal(data, payload) {
+		t.Fatal("UploadPartCopy result differs from the source")
+	}
+	if _, err := c.UploadPartCopy(ctx, &s3.UploadPartCopyInput{Bucket: aws.String("other"), Key: aws.String("partcopy.bin"), UploadId: mp.UploadId,
+		PartNumber: aws.Int32(1), CopySource: aws.String("bkt/big.bin"), CopySourceRange: aws.String("bytes=0-99999999")}); errCode(err) != "InvalidArgument" {
+		t.Fatalf("out-of-range copy: %v", err)
 	}
 
 	// Abort leaves nothing behind.

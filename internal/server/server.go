@@ -11,10 +11,12 @@ import (
 	"errors"
 	"hash"
 	"hash/crc32"
+	"hash/crc64"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -65,6 +67,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bucket, key := splitPath(r.URL.Path)
+	if isPostObject(r, bucket, key) {
+		s.postObject(w, r, bucket)
+		return
+	}
 	if !s.authorized(w, r, bucket, key) {
 		return
 	}
@@ -114,6 +120,11 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request, bucket, key 
 		if meta, err := s.Store.Bucket(bucket); err == nil && meta.PublicRead() {
 			return true
 		}
+		if key != "" && subresource(r.URL.Query()) == "" {
+			if m, err := s.Store.HeadObject(bucket, key); err == nil && m.Public {
+				return true
+			}
+		}
 	}
 	s.fail(w, r, http.StatusForbidden, "AccessDenied", "Access Denied.")
 	return false
@@ -162,77 +173,123 @@ func (s *Server) listBuckets(w http.ResponseWriter) {
 // --- buckets ---
 
 func (s *Server) bucketOp(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) {
-	switch r.Method {
-	case http.MethodPut:
-		switch {
-		case q.Has("policy"):
-			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-			s.storeResult(w, r, s.Store.SetPolicy(bucket, string(body)), http.StatusNoContent)
-		case len(q) == 0:
-			if err := s.Store.CreateBucket(bucket); err != nil {
-				s.storeErr(w, r, err)
-				return
-			}
-			w.Header().Set("Location", "/"+bucket)
-			w.WriteHeader(http.StatusOK)
-		default:
-			s.notImplemented(w, r)
+	sub := subresource(q)
+	switch {
+	case r.Method == http.MethodPut && sub == "":
+		if err := s.Store.CreateBucket(bucket); err != nil {
+			s.storeErr(w, r, err)
+			return
 		}
-	case http.MethodHead:
+		w.Header().Set("Location", "/"+bucket)
+		w.WriteHeader(http.StatusOK)
+	case r.Method == http.MethodPut && sub == "policy":
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		s.storeResult(w, r, s.Store.UpdateBucket(bucket, func(m *store.BucketMeta) { m.Policy = string(body) }), http.StatusNoContent)
+	case r.Method == http.MethodPut && bucketConfigs[sub].root != "":
+		s.putBucketConfig(w, r, bucket, sub)
+	case r.Method == http.MethodPut && sub == "acl":
+		// Bucket ACLs beyond private are not modelled; public read is a bucket policy (mc anonymous set download).
+		if acl := r.Header.Get("X-Amz-Acl"); acl != "" && acl != "private" {
+			s.notImplemented(w, r)
+			return
+		}
+		_, err := s.Store.Bucket(bucket)
+		s.storeResult(w, r, err, http.StatusOK)
+	case r.Method == http.MethodHead && sub == "":
 		if _, err := s.Store.Bucket(bucket); err != nil {
 			s.storeErr(w, r, err)
 			return
 		}
 		w.Header().Set("X-Amz-Bucket-Region", s.Region)
 		w.WriteHeader(http.StatusOK)
-	case http.MethodDelete:
-		switch {
-		case q.Has("policy"):
-			s.storeResult(w, r, s.Store.SetPolicy(bucket, ""), http.StatusNoContent)
-		case len(q) == 0:
-			s.storeResult(w, r, s.Store.DeleteBucket(bucket), http.StatusNoContent)
-		default:
-			s.notImplemented(w, r)
-		}
-	case http.MethodPost:
-		if q.Has("delete") {
-			s.deleteObjects(w, r, bucket)
-			return
-		}
-		s.notImplemented(w, r)
-	case http.MethodGet:
+	case r.Method == http.MethodDelete && sub == "":
+		s.storeResult(w, r, s.Store.DeleteBucket(bucket), http.StatusNoContent)
+	case r.Method == http.MethodDelete && sub == "policy":
+		s.storeResult(w, r, s.Store.UpdateBucket(bucket, func(m *store.BucketMeta) { m.Policy = "" }), http.StatusNoContent)
+	case r.Method == http.MethodDelete && bucketConfigs[sub].root != "" && sub != "versioning":
+		s.storeResult(w, r, s.Store.UpdateBucket(bucket, func(m *store.BucketMeta) { delete(m.Configs, sub) }), http.StatusNoContent)
+	case r.Method == http.MethodPost && sub == "delete":
+		s.deleteObjects(w, r, bucket)
+	case r.Method == http.MethodGet:
 		meta, err := s.Store.Bucket(bucket)
 		if err != nil {
 			s.storeErr(w, r, err)
 			return
 		}
-		switch {
-		case q.Has("location"):
+		switch sub {
+		case "", "versions":
+			s.listObjects(w, r, bucket, q)
+		case "location":
 			writeXML(w, http.StatusOK, struct {
 				XMLName xml.Name `xml:"LocationConstraint"`
 				NS      string   `xml:"xmlns,attr"`
 				Region  string   `xml:",chardata"`
 			}{NS: s3NS, Region: s.Region})
-		case q.Has("policy"):
+		case "policy":
 			if meta.Policy == "" {
 				s.fail(w, r, http.StatusNotFound, "NoSuchBucketPolicy", "The bucket policy does not exist")
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
 			io.WriteString(w, meta.Policy)
-		case q.Has("versioning"):
-			writeXML(w, http.StatusOK, struct {
-				XMLName xml.Name `xml:"VersioningConfiguration"`
-				NS      string   `xml:"xmlns,attr"`
-			}{NS: s3NS})
-		case q.Has("uploads"), q.Has("cors"), q.Has("lifecycle"), q.Has("tagging"), q.Has("object-lock"), q.Has("encryption"), q.Has("acl"), q.Has("notification"), q.Has("replication"), q.Has("website"):
-			s.notImplemented(w, r)
+		case "cors", "lifecycle", "encryption", "tagging", "versioning":
+			cfg, ok := meta.Configs[sub]
+			if !ok && sub == "versioning" {
+				cfg, ok = `<VersioningConfiguration xmlns="`+s3NS+`"/>`, true // never enabled
+			}
+			if !ok {
+				s.fail(w, r, http.StatusNotFound, bucketConfigs[sub].missing, bucketConfigs[sub].message)
+				return
+			}
+			w.Header().Set("Content-Type", "application/xml")
+			io.WriteString(w, cfg)
+		case "acl":
+			writeACL(w, meta.PublicRead())
+		case "uploads":
+			s.listUploads(w, r, bucket, q)
 		default:
-			s.listObjects(w, r, bucket, q)
+			s.notImplemented(w, r)
 		}
-	default:
+	case r.Method != http.MethodPut && r.Method != http.MethodHead && r.Method != http.MethodDelete && r.Method != http.MethodPost:
 		s.fail(w, r, http.StatusMethodNotAllowed, "MethodNotAllowed", "")
+	default:
+		s.notImplemented(w, r)
 	}
+}
+
+// subresource names the query parameter that selects an operation (uploadId, tagging, acl, cors, ...), or ""
+// for the bucket or object itself. Authentication, response-* overrides and the parameters of list
+// operations do not count; an unknown parameter does, so the request is refused instead of being served
+// as a plain GET, PUT or DELETE.
+func subresource(q url.Values) string {
+	var subs []string
+	for k := range q {
+		switch {
+		case isAuthParam(k), strings.HasPrefix(k, "response-"), listParams[k],
+			k == "partNumber" && q.Has("uploadId"),
+			k == "versionId" && q.Get(k) == "null": // every object is the "null" version
+		default:
+			subs = append(subs, k)
+		}
+	}
+	sort.Strings(subs)
+	return strings.Join(subs, "&")
+}
+
+var listParams = map[string]bool{
+	"list-type": true, "prefix": true, "delimiter": true, "marker": true, "max-keys": true, "continuation-token": true,
+	"start-after": true, "fetch-owner": true, "encoding-type": true, "key-marker": true, "version-id-marker": true,
+	"upload-id-marker": true, "max-uploads": true, "max-parts": true, "part-number-marker": true,
+}
+
+// isAuthParam is true for SigV4 (X-Amz-*) and SigV2 presigned query parameters, including the headers
+// botocore moves into a SigV2 presigned URL.
+func isAuthParam(k string) bool {
+	switch k {
+	case "AWSAccessKeyId", "Signature", "Expires", "content-type", "content-md5":
+		return true
+	}
+	return strings.HasPrefix(k, "X-Amz-") || strings.HasPrefix(k, "x-amz-")
 }
 
 func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) {
@@ -245,6 +302,9 @@ func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, bucket stri
 	}
 	prefix, delimiter := q.Get("prefix"), q.Get("delimiter")
 	after := q.Get("marker")
+	if q.Has("versions") {
+		after = q.Get("key-marker")
+	}
 	if v2 {
 		after = q.Get("start-after")
 		if tok := q.Get("continuation-token"); tok != "" {
@@ -283,6 +343,45 @@ func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, bucket stri
 	prefixes := make([]commonPrefix, 0, len(res.CommonPrefixes))
 	for _, p := range res.CommonPrefixes {
 		prefixes = append(prefixes, commonPrefix{enc(p)})
+	}
+	if q.Has("versions") {
+		// No versioning: each object is its only version, with the version ID "null".
+		type version struct {
+			Key          string
+			VersionId    string
+			IsLatest     bool
+			LastModified string
+			ETag         string
+			Size         int64
+			StorageClass string
+			Owner        owner
+		}
+		versions := make([]version, len(contents))
+		for i, c := range contents {
+			versions[i] = version{c.Key, "null", true, c.LastModified, c.ETag, c.Size, "STANDARD", defaultOwner}
+		}
+		out := struct {
+			XMLName             xml.Name `xml:"ListVersionsResult"`
+			NS                  string   `xml:"xmlns,attr"`
+			Name                string
+			Prefix              string
+			KeyMarker           string
+			VersionIdMarker     string
+			NextKeyMarker       string `xml:",omitempty"`
+			NextVersionIdMarker string `xml:",omitempty"`
+			MaxKeys             int
+			Delimiter           string `xml:",omitempty"`
+			EncodingType        string `xml:",omitempty"`
+			IsTruncated         bool
+			Versions            []version `xml:"Version"`
+			CommonPrefixes      []commonPrefix
+		}{NS: s3NS, Name: bucket, Prefix: enc(prefix), KeyMarker: enc(q.Get("key-marker")), VersionIdMarker: q.Get("version-id-marker"),
+			MaxKeys: max, Delimiter: enc(delimiter), EncodingType: encodingType, IsTruncated: res.Truncated, Versions: versions, CommonPrefixes: prefixes}
+		if res.Truncated {
+			out.NextKeyMarker, out.NextVersionIdMarker = enc(strings.TrimSuffix(res.NextMarker, "\xff")), "null"
+		}
+		writeXML(w, http.StatusOK, out)
+		return
 	}
 	if v2 {
 		out := struct {
@@ -362,54 +461,51 @@ func (s *Server) deleteObjects(w http.ResponseWriter, r *http.Request, bucket st
 // --- objects ---
 
 func (s *Server) objectOp(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
-	switch r.Method {
-	case http.MethodPut:
-		switch {
-		case q.Has("uploadId") && q.Has("partNumber") && r.Header.Get("X-Amz-Copy-Source") != "":
-			s.notImplemented(w, r) // UploadPartCopy
-		case q.Has("uploadId") && q.Has("partNumber"):
-			s.uploadPart(w, r, bucket, key, q)
-		case r.Header.Get("X-Amz-Copy-Source") != "":
-			s.copyObject(w, r, bucket, key)
-		case len(q) == 0 || onlyAuthQuery(q):
-			s.putObject(w, r, bucket, key)
-		default:
-			s.notImplemented(w, r)
-		}
-	case http.MethodGet, http.MethodHead:
-		if q.Has("uploadId") {
-			s.listParts(w, r, bucket, key, q)
-			return
-		}
+	sub := subresource(q)
+	copySource := r.Header.Get("X-Amz-Copy-Source") != ""
+	switch {
+	case r.Method == http.MethodPut && sub == "" && copySource:
+		s.copyObject(w, r, bucket, key)
+	case r.Method == http.MethodPut && sub == "":
+		s.putObject(w, r, bucket, key)
+	case r.Method == http.MethodPut && sub == "uploadId" && copySource:
+		s.uploadPartCopy(w, r, bucket, key, q)
+	case r.Method == http.MethodPut && sub == "uploadId":
+		s.uploadPart(w, r, bucket, key, q)
+	case r.Method == http.MethodPut && sub == "tagging":
+		s.putTagging(w, r, bucket, key)
+	case r.Method == http.MethodPut && sub == "acl":
+		s.putObjectACL(w, r, bucket, key)
+	case (r.Method == http.MethodGet || r.Method == http.MethodHead) && sub == "":
 		s.getObject(w, r, bucket, key, q)
-	case http.MethodDelete:
-		if id := q.Get("uploadId"); id != "" {
-			s.storeResult(w, r, s.Store.AbortUpload(bucket, key, id), http.StatusNoContent)
+	case r.Method == http.MethodGet && sub == "uploadId":
+		s.listParts(w, r, bucket, key, q)
+	case r.Method == http.MethodGet && sub == "tagging":
+		s.getTagging(w, r, bucket, key)
+	case r.Method == http.MethodGet && sub == "attributes":
+		s.getAttributes(w, r, bucket, key)
+	case r.Method == http.MethodGet && sub == "acl":
+		m, err := s.Store.HeadObject(bucket, key)
+		if err != nil {
+			s.storeErr(w, r, err)
 			return
 		}
+		writeACL(w, m.Public)
+	case r.Method == http.MethodDelete && sub == "":
 		s.storeResult(w, r, s.Store.DeleteObject(bucket, key), http.StatusNoContent)
-	case http.MethodPost:
-		switch {
-		case q.Has("uploads"):
-			s.createUpload(w, r, bucket, key)
-		case q.Has("uploadId"):
-			s.completeUpload(w, r, bucket, key, q.Get("uploadId"))
-		default:
-			s.notImplemented(w, r)
-		}
-	default:
+	case r.Method == http.MethodDelete && sub == "uploadId":
+		s.storeResult(w, r, s.Store.AbortUpload(bucket, key, q.Get("uploadId")), http.StatusNoContent)
+	case r.Method == http.MethodDelete && sub == "tagging":
+		s.storeResult(w, r, s.Store.UpdateObject(bucket, key, func(m *store.ObjectMeta) { m.Tags = nil }), http.StatusNoContent)
+	case r.Method == http.MethodPost && sub == "uploads":
+		s.createUpload(w, r, bucket, key)
+	case r.Method == http.MethodPost && sub == "uploadId":
+		s.completeUpload(w, r, bucket, key, q.Get("uploadId"))
+	case r.Method != http.MethodPut && r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodDelete && r.Method != http.MethodPost:
 		s.fail(w, r, http.StatusMethodNotAllowed, "MethodNotAllowed", "")
+	default:
+		s.notImplemented(w, r)
 	}
-}
-
-// onlyAuthQuery is true for presigned PUTs, whose query carries nothing but the X-Amz-* auth pairs.
-func onlyAuthQuery(q url.Values) bool {
-	for k := range q {
-		if !strings.HasPrefix(k, "X-Amz-") && !strings.HasPrefix(k, "x-amz-") {
-			return false
-		}
-	}
-	return true
 }
 
 func objectMetaFromRequest(r *http.Request, key string) store.ObjectMeta {
@@ -431,8 +527,25 @@ func objectMetaFromRequest(r *http.Request, key string) store.ObjectMeta {
 			meta.UserMeta[strings.TrimPrefix(lower, "x-amz-meta-")] = strings.Join(values, ",")
 		}
 	}
+	meta.Tags = requestTags(r)
+	meta.Public = publicACL(r.Header.Get("X-Amz-Acl"))
 	return meta
 }
+
+// requestTags parses the x-amz-tagging header, which carries tags as a URL query string.
+func requestTags(r *http.Request) map[string]string {
+	q, _ := url.ParseQuery(r.Header.Get("X-Amz-Tagging"))
+	if len(q) == 0 {
+		return nil
+	}
+	tags := make(map[string]string, len(q))
+	for k := range q {
+		tags[k] = q.Get(k)
+	}
+	return tags
+}
+
+func publicACL(canned string) bool { return canned == "public-read" || canned == "public-read-write" }
 
 func requestBody(r *http.Request) io.Reader {
 	if isAWSChunked(r) {
@@ -443,13 +556,16 @@ func requestBody(r *http.Request) io.Reader {
 
 // checksumHashes are the x-amz-checksum-* algorithms PutObject answers for. The value is computed over the
 // stored bytes, not copied from the request; a client-sent value is not compared against it.
-// ponytail: no CRC64NVME (no SDK we serve defaults to it); add a crc64 table with poly 0x9a6c9329ac4bc9b5 if one does.
 var checksumHashes = map[string]func() hash.Hash{
-	"crc32":  func() hash.Hash { return crc32.NewIEEE() },
-	"crc32c": func() hash.Hash { return crc32.New(crc32.MakeTable(crc32.Castagnoli)) },
-	"sha1":   sha1.New,
-	"sha256": sha256.New,
+	"crc32":     func() hash.Hash { return crc32.NewIEEE() },
+	"crc32c":    func() hash.Hash { return crc32.New(crc32.MakeTable(crc32.Castagnoli)) },
+	"sha1":      sha1.New,
+	"sha256":    sha256.New,
+	"crc64nvme": func() hash.Hash { return crc64.New(crc64NVME) },
 }
+
+// crc64NVME is the CRC-64/NVME table; the AWS CLI v2 sends x-amz-checksum-crc64nvme by default.
+var crc64NVME = crc64.MakeTable(0x9a6c9329ac4bc9b5)
 
 // requestedChecksum names the algorithm a request asked for: the SDK header, an aws-chunked trailer, or a
 // checksum header sent up front.
@@ -476,7 +592,12 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		sum = newHash()
 		body = io.TeeReader(body, sum)
 	}
-	meta, err := s.Store.PutObject(bucket, objectMetaFromRequest(r, key), body)
+	if inm := r.Header.Get("If-None-Match"); inm != "" && inm != "*" {
+		s.fail(w, r, http.StatusNotImplemented, "NotImplemented", "If-None-Match on PUT only supports *")
+		return
+	}
+	cond := store.Precondition{IfMatch: r.Header.Get("If-Match"), IfNoneMatch: r.Header.Get("If-None-Match")}
+	meta, err := s.Store.PutObject(bucket, objectMetaFromRequest(r, key), body, cond)
 	if err != nil {
 		s.storeErr(w, r, err)
 		return
@@ -489,17 +610,22 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key s
 }
 
 func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	src, _, _ := strings.Cut(r.Header.Get("X-Amz-Copy-Source"), "?")
-	if decoded, err := url.PathUnescape(src); err == nil {
-		src = decoded
+	srcBucket, srcKey := copySource(r)
+	src, err := s.Store.HeadObject(srcBucket, srcKey)
+	if err != nil {
+		s.storeErr(w, r, err)
+		return
 	}
-	srcBucket, srcKey := splitPath("/" + strings.TrimPrefix(src, "/"))
-	var replace *store.ObjectMeta
+	meta := src
 	if strings.EqualFold(r.Header.Get("X-Amz-Metadata-Directive"), "REPLACE") {
-		m := objectMetaFromRequest(r, key)
-		replace = &m
+		meta = objectMetaFromRequest(r, key)
+		meta.Tags = src.Tags
 	}
-	meta, err := s.Store.CopyObject(srcBucket, srcKey, bucket, key, replace)
+	if strings.EqualFold(r.Header.Get("X-Amz-Tagging-Directive"), "REPLACE") {
+		meta.Tags = requestTags(r)
+	}
+	meta.Public = publicACL(r.Header.Get("X-Amz-Acl")) // S3 does not copy the ACL
+	meta, err = s.Store.CopyObject(srcBucket, srcKey, bucket, key, &meta)
 	if err != nil {
 		s.storeErr(w, r, err)
 		return
@@ -510,6 +636,15 @@ func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		LastModified string
 		ETag         string
 	}{NS: s3NS, LastModified: isoTime(meta.LastModified), ETag: meta.ETag})
+}
+
+// copySource splits x-amz-copy-source ("bucket/key", URL-encoded, optionally "?versionId=...").
+func copySource(r *http.Request) (bucket, key string) {
+	src, _, _ := strings.Cut(r.Header.Get("X-Amz-Copy-Source"), "?")
+	if decoded, err := url.PathUnescape(src); err == nil {
+		src = decoded
+	}
+	return splitPath("/" + strings.TrimPrefix(src, "/"))
 }
 
 // responseOverrides are the presigned-GET query parameters that replace response headers.
@@ -550,7 +685,10 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		h.Set(name, v)
 	}
 	for name, v := range meta.UserMeta {
-		h.Set("X-Amz-Meta-"+name, v)
+		h["x-amz-meta-"+name] = []string{v} // lowercase as S3 sends it: boto3 keys Metadata by the raw header name
+	}
+	if len(meta.Tags) > 0 {
+		h.Set("X-Amz-Tagging-Count", strconv.Itoa(len(meta.Tags)))
 	}
 	for param, header := range responseOverrides {
 		if v := q.Get(param); v != "" {
@@ -559,6 +697,57 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 	}
 	// ServeContent handles Range, If-Range, If-None-Match and HEAD.
 	http.ServeContent(w, r, "", meta.LastModified, body)
+}
+
+// getAttributes answers GetObjectAttributes for the attributes ss33 has: ETag, size, storage class and parts.
+func (s *Server) getAttributes(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	m, err := s.Store.HeadObject(bucket, key)
+	if err != nil {
+		s.storeErr(w, r, err)
+		return
+	}
+	want := map[string]bool{}
+	for _, v := range r.Header.Values("X-Amz-Object-Attributes") {
+		for _, a := range strings.Split(v, ",") {
+			want[strings.TrimSpace(a)] = true
+		}
+	}
+	type partXML struct {
+		PartNumber int
+		Size       int64
+	}
+	type partsXML struct {
+		TotalPartsCount int
+		PartsCount      int
+		IsTruncated     bool
+		Parts           []partXML `xml:"Part"`
+	}
+	out := struct {
+		XMLName      xml.Name  `xml:"GetObjectAttributesResponse"`
+		NS           string    `xml:"xmlns,attr"`
+		ETag         string    `xml:",omitempty"`
+		ObjectParts  *partsXML `xml:",omitempty"`
+		StorageClass string    `xml:",omitempty"`
+		ObjectSize   *int64    `xml:",omitempty"`
+	}{NS: s3NS}
+	if want["ETag"] {
+		out.ETag = strings.Trim(m.ETag, `"`)
+	}
+	if want["StorageClass"] {
+		out.StorageClass = "STANDARD"
+	}
+	if want["ObjectSize"] {
+		out.ObjectSize = &m.Size
+	}
+	if want["ObjectParts"] && m.Parts != nil {
+		p := &partsXML{TotalPartsCount: len(m.Parts), PartsCount: len(m.Parts)}
+		for i, size := range m.Parts {
+			p.Parts = append(p.Parts, partXML{i + 1, size})
+		}
+		out.ObjectParts = p
+	}
+	w.Header().Set("Last-Modified", m.LastModified.UTC().Format(http.TimeFormat))
+	writeXML(w, http.StatusOK, out)
 }
 
 // zeros backs the HEAD body; ServeContent only seeks it (a multi-range HEAD may read and discard).
@@ -586,10 +775,18 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request, bucket, ke
 	}{NS: s3NS, Bucket: bucket, Key: key, UploadId: id})
 }
 
-func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
+func (s *Server) partNumber(w http.ResponseWriter, r *http.Request, q url.Values) (int, bool) {
 	n, err := strconv.Atoi(q.Get("partNumber"))
 	if err != nil || n < 1 || n > 10000 {
 		s.fail(w, r, http.StatusBadRequest, "InvalidArgument", "Part number must be an integer between 1 and 10000, inclusive")
+		return 0, false
+	}
+	return n, true
+}
+
+func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
+	n, ok := s.partNumber(w, r, q)
+	if !ok {
 		return
 	}
 	etag, err := s.Store.PutPart(bucket, key, q.Get("uploadId"), n, requestBody(r))
@@ -599,6 +796,88 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key 
 	}
 	w.Header().Set("ETag", etag)
 	w.WriteHeader(http.StatusOK)
+}
+
+// uploadPartCopy fills a part from (a byte range of) an existing object: boto3's managed copy and the Java
+// transfer manager use it for large objects.
+func (s *Server) uploadPartCopy(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
+	n, ok := s.partNumber(w, r, q)
+	if !ok {
+		return
+	}
+	srcBucket, srcKey := copySource(r)
+	src, f, err := s.Store.OpenObject(srcBucket, srcKey)
+	if err != nil {
+		s.storeErr(w, r, err)
+		return
+	}
+	defer f.Close()
+	var body io.Reader = f
+	if rng := r.Header.Get("X-Amz-Copy-Source-Range"); rng != "" {
+		first, last, ok := parseByteRange(rng)
+		if !ok || last >= src.Size {
+			s.fail(w, r, http.StatusBadRequest, "InvalidArgument", "Range specified is not valid for source object of size: "+strconv.FormatInt(src.Size, 10))
+			return
+		}
+		if _, err := f.Seek(first, io.SeekStart); err != nil {
+			s.storeErr(w, r, err)
+			return
+		}
+		body = io.LimitReader(f, last-first+1)
+	}
+	etag, err := s.Store.PutPart(bucket, key, q.Get("uploadId"), n, body)
+	if err != nil {
+		s.storeErr(w, r, err)
+		return
+	}
+	writeXML(w, http.StatusOK, struct {
+		XMLName      xml.Name `xml:"CopyPartResult"`
+		NS           string   `xml:"xmlns,attr"`
+		LastModified string
+		ETag         string
+	}{NS: s3NS, LastModified: isoTime(s.now()), ETag: etag})
+}
+
+// parseByteRange parses "bytes=first-last", the only form x-amz-copy-source-range takes.
+func parseByteRange(v string) (first, last int64, ok bool) {
+	a, b, found := strings.Cut(strings.TrimPrefix(v, "bytes="), "-")
+	first, err1 := strconv.ParseInt(a, 10, 64)
+	last, err2 := strconv.ParseInt(b, 10, 64)
+	return first, last, found && strings.HasPrefix(v, "bytes=") && err1 == nil && err2 == nil && first >= 0 && first <= last
+}
+
+func (s *Server) listUploads(w http.ResponseWriter, r *http.Request, bucket string, q url.Values) {
+	uploads, err := s.Store.ListUploads(bucket, q.Get("prefix"))
+	if err != nil {
+		s.storeErr(w, r, err)
+		return
+	}
+	type uploadXML struct {
+		Key          string
+		UploadId     string
+		Initiator    owner
+		Owner        owner
+		StorageClass string
+		Initiated    string
+	}
+	out := struct {
+		XMLName            xml.Name `xml:"ListMultipartUploadsResult"`
+		NS                 string   `xml:"xmlns,attr"`
+		Bucket             string
+		KeyMarker          string
+		UploadIdMarker     string
+		NextKeyMarker      string
+		NextUploadIdMarker string
+		Prefix             string
+		MaxUploads         int
+		IsTruncated        bool
+		Uploads            []uploadXML `xml:"Upload"`
+	}{NS: s3NS, Bucket: bucket, Prefix: q.Get("prefix"), MaxUploads: 1000}
+	// ponytail: no pagination; every open upload is returned in one page.
+	for _, u := range uploads {
+		out.Uploads = append(out.Uploads, uploadXML{u.Key, u.ID, defaultOwner, defaultOwner, "STANDARD", isoTime(u.Created)})
+	}
+	writeXML(w, http.StatusOK, out)
 }
 
 func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request, bucket, key, id string) {
@@ -656,6 +935,92 @@ func (s *Server) listParts(w http.ResponseWriter, r *http.Request, bucket, key s
 	writeXML(w, http.StatusOK, out)
 }
 
+// --- tagging, ACLs, CORS ---
+
+type tagging struct {
+	XMLName xml.Name                      `xml:"Tagging"`
+	NS      string                        `xml:"xmlns,attr,omitempty"`
+	Tags    []struct{ Key, Value string } `xml:"TagSet>Tag"`
+}
+
+func (s *Server) getTagging(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	m, err := s.Store.HeadObject(bucket, key)
+	if err != nil {
+		s.storeErr(w, r, err)
+		return
+	}
+	out := tagging{NS: s3NS, Tags: []struct{ Key, Value string }{}}
+	for k, v := range m.Tags {
+		out.Tags = append(out.Tags, struct{ Key, Value string }{k, v})
+	}
+	sort.Slice(out.Tags, func(i, j int) bool { return out.Tags[i].Key < out.Tags[j].Key })
+	writeXML(w, http.StatusOK, out)
+}
+
+func (s *Server) putTagging(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	var in tagging
+	if err := xml.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&in); err != nil {
+		s.fail(w, r, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed")
+		return
+	}
+	tags := make(map[string]string, len(in.Tags))
+	for _, t := range in.Tags {
+		tags[t.Key] = t.Value
+	}
+	s.storeResult(w, r, s.Store.UpdateObject(bucket, key, func(m *store.ObjectMeta) { m.Tags = tags }), http.StatusOK)
+}
+
+// putObjectACL takes a canned ACL header or an AccessControlPolicy body; the only distinction kept is
+// whether everyone may read.
+func (s *Server) putObjectACL(w http.ResponseWriter, r *http.Request, bucket, key string) {
+	public := publicACL(r.Header.Get("X-Amz-Acl"))
+	if r.Header.Get("X-Amz-Acl") == "" {
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		public = strings.Contains(string(body), "/global/AllUsers")
+	}
+	s.storeResult(w, r, s.Store.UpdateObject(bucket, key, func(m *store.ObjectMeta) { m.Public = public }), http.StatusOK)
+}
+
+const aclXML = `<AccessControlPolicy xmlns="` + s3NS + `"><Owner><ID>ss33</ID><DisplayName>ss33</DisplayName></Owner><AccessControlList>` +
+	`<Grant><Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser"><ID>ss33</ID><DisplayName>ss33</DisplayName></Grantee><Permission>FULL_CONTROL</Permission></Grant>`
+
+const publicGrantXML = `<Grant><Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="Group"><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee><Permission>READ</Permission></Grant>`
+
+func writeACL(w http.ResponseWriter, public bool) {
+	w.Header().Set("Content-Type", "application/xml")
+	io.WriteString(w, xml.Header+aclXML)
+	if public {
+		io.WriteString(w, publicGrantXML)
+	}
+	io.WriteString(w, `</AccessControlList></AccessControlPolicy>`)
+}
+
+// bucketConfigs are bucket configurations that are stored and returned but not acted on: CORS stays open to
+// every origin (see cors), lifecycle rules never expire anything, encryption is not applied, and versioning
+// keeps only the latest version. Bootstrap scripts set them; failing those calls would stop the script.
+var bucketConfigs = map[string]struct{ root, missing, message string }{
+	"cors":       {"CORSConfiguration", "NoSuchCORSConfiguration", "The CORS configuration does not exist"},
+	"lifecycle":  {"LifecycleConfiguration", "NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist"},
+	"encryption": {"ServerSideEncryptionConfiguration", "ServerSideEncryptionConfigurationNotFoundError", "The server side encryption configuration was not found"},
+	"tagging":    {"Tagging", "NoSuchTagSet", "The TagSet does not exist"},
+	"versioning": {"VersioningConfiguration", "", ""},
+}
+
+func (s *Server) putBucketConfig(w http.ResponseWriter, r *http.Request, bucket, sub string) {
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 256<<10))
+	var root struct{ XMLName xml.Name }
+	if xml.Unmarshal(body, &root) != nil || root.XMLName.Local != bucketConfigs[sub].root {
+		s.fail(w, r, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema")
+		return
+	}
+	s.storeResult(w, r, s.Store.UpdateBucket(bucket, func(m *store.BucketMeta) {
+		if m.Configs == nil {
+			m.Configs = map[string]string{}
+		}
+		m.Configs[sub] = string(body)
+	}), http.StatusOK)
+}
+
 // --- responses ---
 
 type owner struct {
@@ -677,6 +1042,7 @@ var storeErrors = map[error]struct {
 	store.ErrNoSuchUpload:     {http.StatusNotFound, "The specified upload does not exist."},
 	store.ErrInvalidPart:      {http.StatusBadRequest, "One or more of the specified parts could not be found."},
 	store.ErrInvalidPartOrder: {http.StatusBadRequest, "The list of parts was not in ascending order."},
+	store.ErrPrecondition:     {http.StatusPreconditionFailed, "At least one of the pre-conditions you specified did not hold"},
 }
 
 func (s *Server) storeErr(w http.ResponseWriter, r *http.Request, err error) {

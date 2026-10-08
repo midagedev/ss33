@@ -352,7 +352,11 @@ func TestUserMetadataHeadersAreLowercase(t *testing.T) {
 	creds := sigv4.Credentials{AccessKey: testAK, SecretKey: testSK}
 	srv := &server.Server{Store: st, Creds: creds, Region: "us-east-1"}
 	do := func(method, path string, header http.Header) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(method, "http://s3.local"+path, strings.NewReader("x"))
+		body := "x"
+		if strings.Count(path, "/") == 1 {
+			body = "" // CreateBucket: a body would have to be a CreateBucketConfiguration
+		}
+		req := httptest.NewRequest(method, "http://s3.local"+path, strings.NewReader(body))
 		for k, v := range header {
 			req.Header[k] = v
 		}
@@ -534,5 +538,157 @@ func TestListWithMetadata(t *testing.T) {
 		if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), want) {
 			t.Fatalf("%s: want %s in\n%s", resp.Status, want, body)
 		}
+	}
+}
+
+// ListParts pages with max-parts and always reports IsTruncated and the markers: the Docker registry's S3
+// driver dereferences them and crashed when they were missing.
+func TestListPartsPaging(t *testing.T) {
+	ctx := context.Background()
+	_, c := newServer(t)
+	mustBucket(t, c, "bkt")
+	up, err := c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String("bkt"), Key: aws.String("k")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for n := int32(1); n <= 3; n++ {
+		if _, err := c.UploadPart(ctx, &s3.UploadPartInput{Bucket: aws.String("bkt"), Key: aws.String("k"), UploadId: up.UploadId,
+			PartNumber: aws.Int32(n), Body: strings.NewReader("part")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got []int32
+	in := &s3.ListPartsInput{Bucket: aws.String("bkt"), Key: aws.String("k"), UploadId: up.UploadId, MaxParts: aws.Int32(2)}
+	for {
+		page, err := c.ListParts(ctx, in)
+		if err != nil || page.IsTruncated == nil || page.MaxParts == nil || page.NextPartNumberMarker == nil {
+			t.Fatalf("ListParts: %v %+v", err, page)
+		}
+		for _, p := range page.Parts {
+			got = append(got, aws.ToInt32(p.PartNumber))
+		}
+		if !aws.ToBool(page.IsTruncated) {
+			break
+		}
+		in.PartNumberMarker = page.NextPartNumberMarker
+	}
+	if fmt.Sprint(got) != "[1 2 3]" {
+		t.Fatalf("paged parts: %v", got)
+	}
+}
+
+// GET ?partNumber=N serves one part of a multipart object, which multipart downloaders (the Java SDK's
+// multipart client, the CRT) fetch in parallel. A single-part object has exactly one part.
+func TestGetObjectPartNumber(t *testing.T) {
+	ctx := context.Background()
+	_, c := newServer(t)
+	mustBucket(t, c, "bkt")
+	first, second := bytes.Repeat([]byte("a"), 5<<20), []byte("tail")
+	up, _ := c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String("bkt"), Key: aws.String("mp")})
+	var done []types.CompletedPart
+	for i, body := range [][]byte{first, second} {
+		n := int32(i + 1)
+		p, err := c.UploadPart(ctx, &s3.UploadPartInput{Bucket: aws.String("bkt"), Key: aws.String("mp"), UploadId: up.UploadId, PartNumber: &n, Body: bytes.NewReader(body)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		done = append(done, types.CompletedPart{PartNumber: &n, ETag: p.ETag})
+	}
+	if _, err := c.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: aws.String("bkt"), Key: aws.String("mp"), UploadId: up.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: done}}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("bkt"), Key: aws.String("mp"), PartNumber: aws.Int32(2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(out.Body)
+	out.Body.Close()
+	if string(body) != "tail" || aws.ToInt32(out.PartsCount) != 2 || aws.ToString(out.ContentRange) != fmt.Sprintf("bytes %d-%d/%d", 5<<20, 5<<20+3, 5<<20+4) {
+		t.Fatalf("part 2: %q parts=%d range=%q", body, aws.ToInt32(out.PartsCount), aws.ToString(out.ContentRange))
+	}
+	if h, err := c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String("bkt"), Key: aws.String("mp"), PartNumber: aws.Int32(1)}); err != nil || aws.ToInt64(h.ContentLength) != 5<<20 {
+		t.Fatalf("HEAD part 1: %v %v", h, err)
+	}
+	if _, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("bkt"), Key: aws.String("mp"), PartNumber: aws.Int32(3)}); errCode(err) != "InvalidPartNumber" {
+		t.Fatalf("part 3 of 2: %v", err)
+	}
+
+	put(t, c, &s3.PutObjectInput{Bucket: aws.String("bkt"), Key: aws.String("single"), Body: strings.NewReader("whole")})
+	one, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("bkt"), Key: aws.String("single"), PartNumber: aws.Int32(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(one.Body)
+	one.Body.Close()
+	if string(body) != "whole" || one.PartsCount != nil {
+		t.Fatalf("single-part object, part 1: %q parts=%v", body, one.PartsCount)
+	}
+}
+
+// ListBuckets pages with max-buckets and a continuation token and filters by prefix (the 2024 API).
+func TestListBucketsPaging(t *testing.T) {
+	ctx := context.Background()
+	_, c := newServer(t)
+	for _, b := range []string{"app-a", "app-b", "app-c", "other"} {
+		mustBucket(t, c, b)
+	}
+	var names []string
+	in := &s3.ListBucketsInput{Prefix: aws.String("app-"), MaxBuckets: aws.Int32(2)}
+	for {
+		page, err := c.ListBuckets(ctx, in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, b := range page.Buckets {
+			names = append(names, aws.ToString(b.Name))
+		}
+		if page.ContinuationToken == nil {
+			break
+		}
+		in.ContinuationToken = page.ContinuationToken
+	}
+	if fmt.Sprint(names) != "[app-a app-b app-c]" {
+		t.Fatalf("paged buckets: %v", names)
+	}
+}
+
+// CompleteMultipartUpload honours If-None-Match: * and If-Match like PutObject, and a failed condition
+// leaves the upload to retry.
+func TestConditionalCompleteMultipartUpload(t *testing.T) {
+	ctx := context.Background()
+	_, c := newServer(t)
+	mustBucket(t, c, "bkt")
+	put(t, c, &s3.PutObjectInput{Bucket: aws.String("bkt"), Key: aws.String("k"), Body: strings.NewReader("exists")})
+	up, _ := c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String("bkt"), Key: aws.String("k")})
+	part, err := c.UploadPart(ctx, &s3.UploadPartInput{Bucket: aws.String("bkt"), Key: aws.String("k"), UploadId: up.UploadId, PartNumber: aws.Int32(1), Body: strings.NewReader("new")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	complete := &s3.CompleteMultipartUploadInput{Bucket: aws.String("bkt"), Key: aws.String("k"), UploadId: up.UploadId, IfNoneMatch: aws.String("*"),
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{{PartNumber: aws.Int32(1), ETag: part.ETag}}}}
+	if _, err := c.CompleteMultipartUpload(ctx, complete); errCode(err) != "PreconditionFailed" {
+		t.Fatalf("If-None-Match: * over an existing key: %v", err)
+	}
+	complete.IfNoneMatch = nil
+	if _, err := c.CompleteMultipartUpload(ctx, complete); err != nil {
+		t.Fatalf("retry without the condition: %v", err)
+	}
+	if got := getBody(t, c, "bkt", "k", ""); got != "new" {
+		t.Fatalf("after completing: %q", got)
+	}
+}
+
+// CreateBucket can tag the bucket in its CreateBucketConfiguration; the Terraform AWS provider does.
+func TestCreateBucketWithTags(t *testing.T) {
+	ctx := context.Background()
+	_, c := newServer(t)
+	if _, err := c.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String("bkt"), CreateBucketConfiguration: &types.CreateBucketConfiguration{
+		Tags: []types.Tag{{Key: aws.String("team"), Value: aws.String("platform")}}}}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := c.GetBucketTagging(ctx, &s3.GetBucketTaggingInput{Bucket: aws.String("bkt")})
+	if err != nil || len(out.TagSet) != 1 || aws.ToString(out.TagSet[0].Value) != "platform" {
+		t.Fatalf("GetBucketTagging: %+v %v", out, err)
 	}
 }

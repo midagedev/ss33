@@ -114,6 +114,7 @@ func (s *Server) storePostedFile(w http.ResponseWriter, r *http.Request, bucket 
 		return
 	}
 
+	s.notify(r, bucket, "s3:ObjectCreated:Post", out)
 	location := "/" + bucket + "/" + out.Key
 	w.Header().Set("ETag", out.ETag)
 	w.Header().Set("Location", location)

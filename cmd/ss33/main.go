@@ -115,6 +115,13 @@ func serve(args []string) error {
 	st.Durable = *durable
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	srv := &server.Server{Store: st, Creds: sigv4.Credentials{AccessKey: *access, SecretKey: *secret}, Region: *region}
+	srv.Webhooks = server.WebhooksFromEnv(os.Environ())
+	// MINIO_DOMAIN turns on virtual-hosted requests (<bucket>.<domain>) in MinIO; several may be comma-separated.
+	for _, d := range strings.Split(envOr([]string{"SS33_DOMAIN", "MINIO_DOMAIN"}, ""), ",") {
+		if d = strings.TrimSpace(d); d != "" {
+			srv.Domains = append(srv.Domains, d)
+		}
+	}
 	if !*quiet {
 		srv.Log = logger
 	}

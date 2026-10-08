@@ -2,12 +2,14 @@ package store
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -48,22 +50,22 @@ func TestReopenRestoresState(t *testing.T) {
 			put("a", "first")
 			put("b", "gone soon")
 			put("a", "second") // overwrite
-			if err := s.DeleteObject("bkt", "b"); err != nil {
+			if _, err := s.DeleteObject("bkt", "b"); err != nil {
 				t.Fatal(err)
 			}
 			id, _ := s.CreateUpload("bkt", ObjectMeta{Key: "mp", ContentType: "model/stl"})
 			e1, _ := s.PutPart("bkt", "mp", id, 1, strings.NewReader("hello "))
 			e2, _ := s.PutPart("bkt", "mp", id, 2, strings.NewReader("world"))
-			if _, err := s.CompleteUpload("bkt", "mp", id, []Part{{Number: 1, ETag: e1}, {Number: 2, ETag: e2}}); err != nil {
+			if _, err := s.CompleteUpload("bkt", "mp", id, []Part{{Number: 1, ETag: e1}, {Number: 2, ETag: e2}}, Precondition{}); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := s.CopyObject("bkt", "a", "bkt", "copy-of-a", nil); err != nil {
+			if _, err := s.CopyObject("bkt", "a", "", "bkt", "copy-of-a", nil); err != nil {
 				t.Fatal(err)
 			}
 			put("mp2", "x")
 			id2, _ := s.CreateUpload("bkt", ObjectMeta{Key: "mp2"})
 			e, _ := s.PutPart("bkt", "mp2", id2, 1, strings.NewReader("multipart over a file"))
-			if _, err := s.CompleteUpload("bkt", "mp2", id2, []Part{{Number: 1, ETag: e}}); err != nil {
+			if _, err := s.CompleteUpload("bkt", "mp2", id2, []Part{{Number: 1, ETag: e}}, Precondition{}); err != nil {
 				t.Fatal(err)
 			}
 			s.Close()
@@ -102,7 +104,7 @@ func TestPartsReaderSeeksAcrossParts(t *testing.T) {
 		etag, _ := s.PutPart("bkt", "k", id, i+1, strings.NewReader(c))
 		parts = append(parts, Part{Number: i + 1, ETag: etag})
 	}
-	if _, err := s.CompleteUpload("bkt", "k", id, parts); err != nil {
+	if _, err := s.CompleteUpload("bkt", "k", id, parts, Precondition{}); err != nil {
 		t.Fatal(err)
 	}
 	_, f, _ := s.OpenObject("bkt", "k")
@@ -172,7 +174,7 @@ func TestCopyRacingOverwriteStaysConsistent(t *testing.T) {
 		}
 	}()
 	for i := 0; i < 2000; i++ {
-		if _, err := s.CopyObject("bkt", "src", "bkt", "dst", nil); err != nil {
+		if _, err := s.CopyObject("bkt", "src", "", "bkt", "dst", nil); err != nil {
 			t.Fatal(err)
 		}
 		meta, f, err := s.OpenObject("bkt", "dst")
@@ -198,7 +200,7 @@ func TestCopyOntoItselfLeavesNoTempFiles(t *testing.T) {
 	s.CreateBucket("bkt")
 	s.PutObject("bkt", ObjectMeta{Key: "k"}, strings.NewReader("v"), Precondition{})
 	for i := 0; i < 3; i++ {
-		if _, err := s.CopyObject("bkt", "k", "bkt", "k", &ObjectMeta{ContentType: "text/plain"}); err != nil {
+		if _, err := s.CopyObject("bkt", "k", "", "bkt", "k", &ObjectMeta{ContentType: "text/plain"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -237,5 +239,209 @@ func TestConcurrentPutPartKeepsOneFile(t *testing.T) {
 		if files, _ := filepath.Glob(filepath.Join(dir, ".uploads", id, "p00001-*")); len(files) != 1 {
 			t.Fatalf("round %d: %d files for part 1", round, len(files))
 		}
+	}
+}
+
+func setVersioning(t *testing.T, s *Store, bucket, status string) {
+	t.Helper()
+	err := s.UpdateBucket(bucket, func(m *BucketMeta) {
+		if m.Configs == nil {
+			m.Configs = map[string]string{}
+		}
+		m.Configs["versioning"] = `<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>` + status + `</Status></VersioningConfiguration>`
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readVersion(t *testing.T, s *Store, bucket, key, versionID string) string {
+	t.Helper()
+	_, f, err := s.OpenVersion(bucket, key, versionID)
+	if err != nil {
+		t.Fatalf("open %s@%s: %v", key, versionID, err)
+	}
+	defer f.Close()
+	data, _ := io.ReadAll(f)
+	return string(data)
+}
+
+func versionIDs(t *testing.T, s *Store, bucket string) []string {
+	t.Helper()
+	res, err := s.ListVersions(bucket, "", "", "", "", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, v := range res.Versions {
+		id := cmp.Or(v.VersionID, "null")
+		if v.DeleteMarker {
+			id = "marker:" + id
+		}
+		ids = append(ids, v.Key+"@"+id)
+	}
+	return ids
+}
+
+// Versioning end to end at the store level, including a restart in the middle.
+func TestVersioning(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.CreateBucket("bkt")
+	put := func(key, body string) ObjectMeta {
+		t.Helper()
+		m, err := s.PutObject("bkt", ObjectMeta{Key: key}, strings.NewReader(body), Precondition{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	put("k", "before") // written before versioning: becomes the null version
+	setVersioning(t, s, "bkt", "Enabled")
+	v1, v2 := put("k", "one"), put("k", "two")
+	if v1.VersionID == "" || v1.VersionID == v2.VersionID {
+		t.Fatalf("version IDs %q %q", v1.VersionID, v2.VersionID)
+	}
+	if got := string(read(t, s, "bkt", "k")); got != "two" {
+		t.Fatalf("current: %q", got)
+	}
+	for id, want := range map[string]string{v1.VersionID: "one", "null": "before", v2.VersionID: "two"} {
+		if got := readVersion(t, s, "bkt", "k", id); got != want {
+			t.Fatalf("version %s: %q, want %q", id, got, want)
+		}
+	}
+
+	del, err := s.DeleteObject("bkt", "k")
+	if err != nil || !del.DeleteMarker {
+		t.Fatalf("delete: %+v %v", del, err)
+	}
+	if m, err := s.HeadObject("bkt", "k"); err != ErrNoSuchKey || !m.DeleteMarker {
+		t.Fatalf("head after delete: %+v %v", m, err)
+	}
+	if _, err := s.Version("bkt", "k", del.VersionID); err != ErrDeleteMarker {
+		t.Fatalf("GET of the marker's version: %v", err)
+	}
+	if res, _ := s.List("bkt", "", "", "", 100); len(res.Objects) != 0 {
+		t.Fatalf("listed under a delete marker: %+v", res.Objects)
+	}
+	if err := s.DeleteBucket("bkt"); err != ErrBucketNotEmpty {
+		t.Fatalf("delete bucket holding only versions: %v", err)
+	}
+
+	// Restart: every version and the marker come back from the journal.
+	s.Close()
+	if s, err = Open(dir); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"k@marker:" + del.VersionID, "k@" + v2.VersionID, "k@" + v1.VersionID, "k@null"}
+	if got := versionIDs(t, s, "bkt"); !slices.Equal(got, want) {
+		t.Fatalf("versions after restart:\n got %v\nwant %v", got, want)
+	}
+
+	// Removing the marker brings v2 back; removing v2 promotes v1.
+	if _, err := s.DeleteVersion("bkt", "k", del.VersionID); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(read(t, s, "bkt", "k")); got != "two" {
+		t.Fatalf("after removing the marker: %q", got)
+	}
+	if _, err := s.DeleteVersion("bkt", "k", v2.VersionID); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(read(t, s, "bkt", "k")); got != "one" {
+		t.Fatalf("after removing the current version: %q", got)
+	}
+	if _, err := s.Version("bkt", "k", v2.VersionID); err != ErrNoSuchVersion {
+		t.Fatalf("removed version still readable: %v", err)
+	}
+
+	// Suspended: writes replace the null version, and other versions stay.
+	setVersioning(t, s, "bkt", "Suspended")
+	put("k", "null-1")
+	put("k", "null-2")
+	if got := versionIDs(t, s, "bkt"); !slices.Equal(got, []string{"k@null", "k@" + v1.VersionID}) {
+		t.Fatalf("after suspended writes: %v", got)
+	}
+	if got := readVersion(t, s, "bkt", "k", "null"); got != "null-2" {
+		t.Fatalf("null version: %q", got)
+	}
+	if del, _ := s.DeleteObject("bkt", "k"); del.VersionID != "null" || !del.DeleteMarker {
+		t.Fatalf("suspended delete: %+v", del)
+	}
+	if got := versionIDs(t, s, "bkt"); !slices.Equal(got, []string{"k@marker:null", "k@" + v1.VersionID}) {
+		t.Fatalf("after suspended delete: %v", got)
+	}
+	if files, _ := filepath.Glob(filepath.Join(dir, "bkt", "*.v-null.bin")); len(files) != 0 {
+		t.Fatalf("replaced null version left bytes behind: %v", files)
+	}
+}
+
+// Multipart objects are directories of parts; they move between current and noncurrent names too.
+func TestVersioningMultipartObjects(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.CreateBucket("bkt")
+	setVersioning(t, s, "bkt", "Enabled")
+	complete := func(body string) ObjectMeta {
+		t.Helper()
+		id, _ := s.CreateUpload("bkt", ObjectMeta{Key: "mp"})
+		etag, err := s.PutPart("bkt", "mp", id, 1, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := s.CompleteUpload("bkt", "mp", id, []Part{{Number: 1, ETag: etag}}, Precondition{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	first := complete("first")
+	complete("second")
+	if got := readVersion(t, s, "bkt", "mp", first.VersionID); got != "first" {
+		t.Fatalf("noncurrent multipart version: %q", got)
+	}
+	cur, _ := s.HeadObject("bkt", "mp")
+	if _, err := s.DeleteVersion("bkt", "mp", cur.VersionID); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(read(t, s, "bkt", "mp")); got != "first" {
+		t.Fatalf("promoted multipart version: %q", got)
+	}
+}
+
+// ListVersions pages one entry at a time across keys and within a key.
+func TestListVersionsPaging(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.CreateBucket("bkt")
+	setVersioning(t, s, "bkt", "Enabled")
+	for _, k := range []string{"a", "a", "b", "c", "c", "c"} {
+		s.PutObject("bkt", ObjectMeta{Key: k}, strings.NewReader(k), Precondition{})
+	}
+	all := versionIDs(t, s, "bkt")
+	var paged []string
+	key, vid := "", ""
+	for i := 0; i < 20; i++ {
+		res, err := s.ListVersions("bkt", "", "", key, vid, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, v := range res.Versions {
+			paged = append(paged, v.Key+"@"+cmp.Or(v.VersionID, "null"))
+		}
+		if !res.Truncated {
+			break
+		}
+		key, vid = res.NextKeyMarker, res.NextVersionIDMarker
+	}
+	if !slices.Equal(paged, all) || len(all) != 6 {
+		t.Fatalf("paged %v\n  all %v", paged, all)
 	}
 }

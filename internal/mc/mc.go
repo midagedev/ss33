@@ -1,10 +1,12 @@
 // Package mc is the subset of the MinIO client CLI that bootstrap scripts use, talking to any S3
-// endpoint: alias set (and config host add, MC_HOST_*), mb, rb, ls, cp, rm, anonymous/policy set, version
-// enable/suspend, ready. Output mirrors mc closely enough that
+// endpoint: alias set (and config host add, MC_HOST_*), mb, rb, ls (--versions), cp, rm (--version-id),
+// anonymous/policy set, version enable/suspend, event add/ls/rm, ready. Output mirrors mc closely enough that
 // `mc ls --recursive ... | wc -l` style scripts keep working.
 package mc
 
 import (
+	"bytes"
+	"cmp"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -85,23 +87,29 @@ func Main(args []string, stdout, stderr io.Writer) int {
 
 type flags map[string]bool
 
-// parseArgs splits flags (any --x / -x) from positional arguments.
-func parseArgs(args []string) (flags, []string) {
-	f := flags{}
+// valueFlags take a value, as `--event put,delete` or `--event=put,delete`. --api and --path (from
+// `config host add`) are read and ignored.
+var valueFlags = map[string]bool{"api": true, "path": true, "event": true, "prefix": true, "suffix": true, "version-id": true}
+
+// parseArgs splits flags (any --x / -x) and their values from positional arguments.
+func parseArgs(args []string) (flags, map[string]string, []string) {
+	f, values := flags{}, map[string]string{}
 	var pos []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if strings.HasPrefix(a, "-") && len(a) > 1 {
-			name := strings.TrimLeft(a, "-")
+			name, value, hasValue := strings.Cut(strings.TrimLeft(a, "-"), "=")
 			f[name] = true
-			if (name == "api" || name == "path") && i+1 < len(args) { // `--api S3v4`, `--path auto`: values ss33 ignores
+			if valueFlags[name] && !hasValue && i+1 < len(args) {
 				i++
+				value = args[i]
 			}
+			values[name] = value
 			continue
 		}
 		pos = append(pos, a)
 	}
-	return f, pos
+	return f, values, pos
 }
 
 func run(args []string, stdout io.Writer) error {
@@ -109,7 +117,7 @@ func run(args []string, stdout io.Writer) error {
 		return errors.New("usage: mc <alias|mb|rb|ls|cp|rm|anonymous|version|ready> ...")
 	}
 	cfg := loadConfig()
-	f, pos := parseArgs(args[1:])
+	f, values, pos := parseArgs(args[1:])
 	if args[0] == "config" && len(pos) > 0 && pos[0] == "host" { // mc config host add: the pre-2021 spelling
 		args, pos = []string{"alias"}, pos[1:]
 		if len(pos) > 0 && pos[0] == "add" {
@@ -162,6 +170,9 @@ func run(args []string, stdout io.Writer) error {
 		if err != nil {
 			return err
 		}
+		if f["versions"] {
+			return t.listVersions(stdout)
+		}
 		return t.list(stdout, f["recursive"] || f["r"])
 	case "cp":
 		if len(pos) != 2 {
@@ -183,6 +194,11 @@ func run(args []string, stdout io.Writer) error {
 				return nil
 			}
 			switch {
+			case values["version-id"] != "":
+				if err := t.call(http.MethodDelete, t.key, url.Values{"versionId": {values["version-id"]}}, nil, 0, nil, http.StatusNoContent, http.StatusOK); err != nil {
+					return err
+				}
+				fmt.Fprintf(stdout, "Removed `%s/%s/%s` (versionId=%s).\n", name, t.bucket, t.key, values["version-id"])
 			case f["recursive"] || f["r"]:
 				if !f["force"] {
 					return errors.New("removal requires --force flag")
@@ -214,6 +230,19 @@ func run(args []string, stdout io.Writer) error {
 		}
 		fmt.Fprintf(stdout, "%s versioning is %sd\n", pos[1], pos[0])
 		return nil
+	case "event":
+		if len(pos) < 2 {
+			return errors.New("usage: mc event add|rm|ls ALIAS/BUCKET [ARN] [--event put,delete] [--prefix P] [--suffix S]")
+		}
+		t, err := cfg.target(pos[1])
+		if err != nil {
+			return err
+		}
+		arn := ""
+		if len(pos) > 2 {
+			arn = pos[2]
+		}
+		return t.event(pos[0], arn, values, f["force"], stdout)
 	case "anonymous", "policy":
 		if len(pos) == 3 && pos[0] == "set" {
 			t, err := cfg.target(pos[2])
@@ -241,7 +270,7 @@ func run(args []string, stdout io.Writer) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("unsupported command %q (ss33 implements alias, mb, rb, ls, cp, rm, anonymous, version, ready)", args[0])
+	return fmt.Errorf("unsupported command %q (ss33 implements alias, mb, rb, ls, cp, rm, anonymous, version, event, ready)", args[0])
 }
 
 // target is an `alias/bucket/prefix` reference.
@@ -438,16 +467,91 @@ func (t target) list(w io.Writer, recursive bool) error {
 	})
 }
 
+// removeBucket deletes the bucket; with force it first removes every object version and delete marker, so
+// a versioned bucket goes too.
 func (t target) removeBucket(force bool) error {
 	if force {
-		err := t.walk(true, func(o listedObject, _ bool) error {
-			return t.call(http.MethodDelete, o.Key, nil, nil, 0, nil, http.StatusNoContent, http.StatusOK)
+		err := t.walkVersions(func(v listedVersion) error {
+			return t.call(http.MethodDelete, v.Key, url.Values{"versionId": {v.VersionId}}, nil, 0, nil, http.StatusNoContent, http.StatusOK)
 		})
 		if err != nil {
 			return err
 		}
 	}
 	return t.call(http.MethodDelete, "", nil, nil, 0, nil, http.StatusNoContent, http.StatusOK)
+}
+
+type listedVersion struct {
+	XMLName      xml.Name
+	Key          string
+	VersionId    string
+	IsLatest     bool
+	LastModified string
+	Size         int64
+}
+
+// walkVersions visits every version and delete marker under the target's prefix, newest first per key.
+func (t target) walkVersions(fn func(v listedVersion) error) error {
+	keyMarker, versionMarker := "", ""
+	for {
+		q := url.Values{"versions": {""}, "prefix": {t.key}}
+		if keyMarker != "" {
+			q.Set("key-marker", keyMarker)
+			q.Set("version-id-marker", versionMarker)
+		}
+		resp, err := t.do(http.MethodGet, "", q, nil, 0, nil)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return checkResp(resp, nil, http.StatusOK)
+		}
+		var out struct {
+			Entries             []listedVersion `xml:",any"`
+			IsTruncated         bool
+			NextKeyMarker       string
+			NextVersionIdMarker string
+		}
+		err = xml.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		if err != nil {
+			return err
+		}
+		for _, v := range out.Entries {
+			if v.XMLName.Local != "Version" && v.XMLName.Local != "DeleteMarker" {
+				continue
+			}
+			if err := fn(v); err != nil {
+				return err
+			}
+		}
+		if !out.IsTruncated {
+			return nil
+		}
+		keyMarker, versionMarker = out.NextKeyMarker, out.NextVersionIdMarker
+	}
+}
+
+// listVersions prints `mc ls --versions` lines: date, size, storage class, version ID, vN, PUT or DEL, key.
+func (t target) listVersions(w io.Writer) error {
+	var all []listedVersion
+	if err := t.walkVersions(func(v listedVersion) error { all = append(all, v); return nil }); err != nil {
+		return err
+	}
+	for i, v := range all {
+		n := 1 // vN counts down to v1, the oldest version of the key
+		for j := i + 1; j < len(all) && all[j].Key == v.Key; j++ {
+			n++
+		}
+		op := "PUT"
+		if v.XMLName.Local == "DeleteMarker" {
+			op = "DEL"
+		}
+		ts, _ := time.Parse("2006-01-02T15:04:05.000Z", v.LastModified)
+		fmt.Fprintf(w, "[%s] %7s STANDARD %s v%d %s %s\n", ts.Local().Format("2006-01-02 15:04:05 MST"), humanSize(v.Size), v.VersionId, n, op,
+			strings.TrimPrefix(v.Key, t.key))
+	}
+	return nil
 }
 
 func (c config) copy(src, dst string, recursive bool, stdout io.Writer, quiet bool) error {
@@ -588,4 +692,97 @@ func humanSize(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+type notificationConfig struct {
+	XMLName xml.Name    `xml:"NotificationConfiguration"`
+	NS      string      `xml:"xmlns,attr,omitempty"`
+	Queues  []queueConf `xml:"QueueConfiguration"`
+}
+
+type queueConf struct {
+	ID     string       `xml:"Id"`
+	Queue  string       `xml:"Queue"`
+	Events []string     `xml:"Event"`
+	Rules  []filterRule `xml:"Filter>S3Key>FilterRule,omitempty"`
+}
+
+type filterRule struct{ Name, Value string }
+
+// mcEvents maps `mc event --event` names to S3 event types.
+var mcEvents = map[string]string{"put": "s3:ObjectCreated:*", "delete": "s3:ObjectRemoved:*", "get": "s3:ObjectAccessed:*"}
+
+// event implements `mc event add|rm|ls`: read the bucket's notification configuration, change the queue
+// entries for arn, and write it back.
+func (t target) event(op, arn string, values map[string]string, force bool, w io.Writer) error {
+	resp, err := t.do(http.MethodGet, "", url.Values{"notification": {""}}, nil, 0, nil)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return checkResp(resp, nil, http.StatusOK)
+	}
+	var cfg notificationConfig
+	err = xml.NewDecoder(resp.Body).Decode(&cfg)
+	resp.Body.Close()
+	if err != nil {
+		return err
+	}
+	switch op {
+	case "ls":
+		for _, q := range cfg.Queues {
+			if arn != "" && q.Queue != arn {
+				continue
+			}
+			line := q.Queue + "   " + strings.Join(q.Events, ",")
+			for _, r := range q.Rules {
+				line += "   Filter: " + strings.ToLower(r.Name) + "=\"" + r.Value + "\""
+			}
+			fmt.Fprintln(w, line)
+		}
+		return nil
+	case "add":
+		if arn == "" {
+			return errors.New("usage: mc event add ALIAS/BUCKET ARN [--event put,delete,get] [--prefix P] [--suffix S]")
+		}
+		q := queueConf{ID: fmt.Sprintf("ss33-%d", time.Now().UnixNano()), Queue: arn}
+		for _, name := range strings.Split(cmp.Or(values["event"], "put,delete,get"), ",") {
+			ev, ok := mcEvents[strings.TrimSpace(name)]
+			if !ok {
+				return fmt.Errorf("unsupported event %q (put, delete, get)", name)
+			}
+			q.Events = append(q.Events, ev)
+		}
+		if p := values["prefix"]; p != "" {
+			q.Rules = append(q.Rules, filterRule{"prefix", p})
+		}
+		if s := values["suffix"]; s != "" {
+			q.Rules = append(q.Rules, filterRule{"suffix", s})
+		}
+		cfg.Queues = append(cfg.Queues, q)
+	case "rm":
+		if arn == "" && !force {
+			return errors.New("usage: mc event rm ALIAS/BUCKET ARN, or --force to remove every notification")
+		}
+		kept := cfg.Queues[:0]
+		for _, q := range cfg.Queues {
+			if arn != "" && q.Queue != arn {
+				kept = append(kept, q)
+			}
+		}
+		cfg.Queues = kept
+	default:
+		return fmt.Errorf("unsupported event command %q (add, rm, ls)", op)
+	}
+	cfg.NS = "http://s3.amazonaws.com/doc/2006-03-01/"
+	body, err := xml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	if err := t.call(http.MethodPut, "", url.Values{"notification": {""}}, bytes.NewReader(body), int64(len(body)), nil, http.StatusOK); err != nil {
+		return err
+	}
+	verb := map[string]string{"add": "added", "rm": "removed"}[op]
+	fmt.Fprintf(w, "Successfully %s %s\n", verb, cmp.Or(arn, "all notifications"))
+	return nil
 }

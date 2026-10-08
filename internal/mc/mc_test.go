@@ -131,3 +131,58 @@ func TestRecursiveDownloadStaysInDestination(t *testing.T) {
 		t.Fatal("file written outside the destination")
 	}
 }
+
+// Versioned buckets from the CLI: version enable, ls --versions, rm --version-id, and rb --force removing
+// every version; event add/ls/rm writing the bucket's notification configuration.
+func TestVersionsAndEvents(t *testing.T) {
+	st, _ := store.Open(t.TempDir())
+	srv := &server.Server{Store: st, Creds: sigv4.Credentials{AccessKey: "admin", SecretKey: "admin-secret"}, Region: "us-east-1",
+		Webhooks: map[string]server.Webhook{"PRIMARY": {Endpoint: "http://127.0.0.1:1"}}}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	t.Setenv("MC_CONFIG_DIR", t.TempDir())
+	run := func(args ...string) string {
+		t.Helper()
+		var out, errOut bytes.Buffer
+		if code := mc.Main(args, &out, &errOut); code != 0 {
+			t.Fatalf("mc %v: exit %d: %s", args, code, errOut.String())
+		}
+		return out.String()
+	}
+	run("alias", "set", "local", ts.URL, "admin", "admin-secret")
+	run("mb", "local/ver")
+	run("version", "enable", "local/ver")
+	src := filepath.Join(t.TempDir(), "f.txt")
+	for _, body := range []string{"one", "two"} {
+		os.WriteFile(src, []byte(body), 0o644)
+		run("cp", src, "local/ver/f.txt")
+	}
+	run("rm", "local/ver/f.txt")
+	listing := run("ls", "--versions", "local/ver")
+	if strings.Count(listing, "\n") != 3 || !strings.Contains(listing, " v3 DEL f.txt") || !strings.Contains(listing, " v1 PUT f.txt") {
+		t.Fatalf("ls --versions:\n%s", listing)
+	}
+	marker := strings.Fields(strings.Split(listing, "\n")[0])[5] // [date time zone] size class versionId ...
+	run("rm", "--version-id", marker, "local/ver/f.txt")
+	if got := run("ls", "local/ver"); !strings.Contains(got, "f.txt") {
+		t.Fatalf("removing the delete marker should bring f.txt back:\n%s", got)
+	}
+
+	run("event", "add", "local/ver", "arn:minio:sqs::PRIMARY:webhook", "--event", "put,delete", "--prefix", "in/")
+	if got := run("event", "ls", "local/ver"); !strings.Contains(got, "arn:minio:sqs::PRIMARY:webhook   s3:ObjectCreated:*,s3:ObjectRemoved:*   Filter: prefix=\"in/\"") {
+		t.Fatalf("event ls:\n%s", got)
+	}
+	var errOut bytes.Buffer
+	if code := mc.Main([]string{"event", "add", "local/ver", "arn:minio:sqs::MISSING:webhook"}, &bytes.Buffer{}, &errOut); code == 0 {
+		t.Fatal("event add accepted a webhook target the server does not have")
+	}
+	run("event", "rm", "local/ver", "arn:minio:sqs::PRIMARY:webhook")
+	if got := run("event", "ls", "local/ver"); got != "" {
+		t.Fatalf("event ls after rm:\n%s", got)
+	}
+
+	run("rb", "--force", "local/ver")
+	if _, err := st.Bucket("ver"); err == nil {
+		t.Fatal("rb --force left a versioned bucket behind")
+	}
+}

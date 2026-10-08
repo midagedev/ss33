@@ -4,12 +4,16 @@
 //	<root>/<bucket>/.meta.log           append-only journal of object metadata (one JSON record per line)
 //	<root>/<bucket>/<sha256(key)>.bin   object bytes
 //	<root>/<bucket>/<sha256(key)>.parts/ object bytes of a completed multipart upload, one file per part
+//	<root>/<bucket>/<sha256(key)>.v-<versionId>.bin (or .parts/) bytes of a noncurrent version
 //	<root>/.uploads/<uploadId>/         in-progress multipart uploads; parts are named p<number>-<md5>
 //
 // Object files are named by key hash because S3 keys go up to 1024 bytes and may contain both "a" and
 // "a/b" — neither fits a filesystem path directly. All metadata lives in memory; the journal only rebuilds
 // it on start, so a PUT costs one data file plus one appended line. Completing a multipart upload moves
 // the part files into place instead of concatenating them.
+//
+// In a bucket with versioning, the current version keeps the plain name, so reading it costs the same as in
+// any other bucket; an overwrite or a delete marker renames the replaced bytes to the version's name.
 //
 // By default nothing is fsynced: ss33 is a test double and the OS page cache is the fast path. Durable
 // makes every write reach the disk before it is acknowledged.
@@ -18,17 +22,20 @@ package store
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,6 +53,8 @@ var (
 	ErrInvalidPart      = errors.New("InvalidPart")
 	ErrInvalidPartOrder = errors.New("InvalidPartOrder")
 	ErrPrecondition     = errors.New("PreconditionFailed")
+	ErrDeleteMarker     = errors.New("MethodNotAllowed") // the requested version is a delete marker
+	ErrNoSuchVersion    = errors.New("NoSuchVersion")
 )
 
 var bucketNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
@@ -60,7 +69,9 @@ type ObjectMeta struct {
 	UserMeta     map[string]string `json:"userMeta,omitempty"` // x-amz-meta-* without the prefix, lowercased
 	Parts        []int64           `json:"parts,omitempty"`    // part sizes when the bytes live in <hash>.parts/
 	Tags         map[string]string `json:"tags,omitempty"`
-	Public       bool              `json:"public,omitempty"` // canned ACL public-read: anonymous GET allowed
+	Public       bool              `json:"public,omitempty"`       // canned ACL public-read: anonymous GET allowed
+	VersionID    string            `json:"versionId,omitempty"`    // "" is the null version
+	DeleteMarker bool              `json:"deleteMarker,omitempty"` // a delete marker has no bytes
 }
 
 type BucketMeta struct {
@@ -80,16 +91,25 @@ type Store struct {
 }
 
 type bucket struct {
-	meta    BucketMeta
-	objects map[string]ObjectMeta
-	log     *os.File // .meta.log, opened for append
-	records int      // lines in the journal; compaction starts when this far outgrows len(objects)
+	meta       BucketMeta
+	versioning string                  // "", "Enabled" or "Suspended", from the stored versioning configuration
+	objects    map[string]ObjectMeta   // the current version of each key, delete markers included
+	versions   map[string][]ObjectMeta // noncurrent versions, newest first; only keys that have any
+	log        *os.File                // .meta.log, opened for append
+	records    int                     // lines in the journal; compaction starts when this far outgrows len(objects)
 }
 
-// record is one journal line: either a put (full metadata) or a delete.
+// record is one journal line: a put (the key's only version), a delete, or a key's full version list
+// (current first) once it has noncurrent versions; an empty list deletes the key.
 type record struct {
-	Put *ObjectMeta `json:"put,omitempty"`
-	Del string      `json:"del,omitempty"`
+	Put  *ObjectMeta  `json:"put,omitempty"`
+	Del  string       `json:"del,omitempty"`
+	Vers *keyVersions `json:"vers,omitempty"`
+}
+
+type keyVersions struct {
+	Key  string       `json:"key"`
+	List []ObjectMeta `json:"list"`
 }
 
 func Open(root string) (*Store, error) {
@@ -128,10 +148,11 @@ func (s *Store) Close() error {
 
 func (s *Store) loadBucket(name string) (*bucket, error) {
 	dir := s.bucketDir(name)
-	b := &bucket{objects: map[string]ObjectMeta{}}
+	b := &bucket{objects: map[string]ObjectMeta{}, versions: map[string][]ObjectMeta{}}
 	if readJSON(filepath.Join(dir, ".bucket.json"), &b.meta) != nil {
 		return nil, nil // not a bucket directory
 	}
+	b.versioning = versioningStatus(b.meta.Configs["versioning"])
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -151,7 +172,7 @@ func (s *Store) loadBucket(name string) (*bucket, error) {
 			legacy = append(legacy, filepath.Join(dir, n))
 		}
 	}
-	if err := replay(filepath.Join(dir, ".meta.log"), b.objects); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := replay(filepath.Join(dir, ".meta.log"), b); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 	if err := s.compact(name, b); err != nil {
@@ -164,7 +185,7 @@ func (s *Store) loadBucket(name string) (*bucket, error) {
 }
 
 // replay applies journal records in order. A torn last line (crash mid-append) is ignored.
-func replay(path string, objects map[string]ObjectMeta) error {
+func replay(path string, b *bucket) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -177,10 +198,15 @@ func replay(path string, objects map[string]ObjectMeta) error {
 		if json.Unmarshal(sc.Bytes(), &rec) != nil {
 			continue
 		}
-		if rec.Put != nil {
-			objects[rec.Put.Key] = *rec.Put
-		} else if rec.Del != "" {
-			delete(objects, rec.Del)
+		switch {
+		case rec.Put != nil:
+			b.objects[rec.Put.Key] = *rec.Put
+			delete(b.versions, rec.Put.Key)
+		case rec.Del != "":
+			delete(b.objects, rec.Del)
+			delete(b.versions, rec.Del)
+		case rec.Vers != nil:
+			b.setVersions(rec.Vers.Key, rec.Vers.List)
 		}
 	}
 	return sc.Err()
@@ -191,8 +217,8 @@ func replay(path string, objects map[string]ObjectMeta) error {
 func (s *Store) compact(name string, b *bucket) error {
 	path := filepath.Join(s.bucketDir(name), ".meta.log")
 	var buf bytes.Buffer
-	for _, m := range b.objects {
-		line, err := json.Marshal(record{Put: &m})
+	for k := range b.objects {
+		line, err := json.Marshal(b.record(k))
 		if err != nil {
 			return err
 		}
@@ -246,6 +272,136 @@ func (s *Store) commit(log *os.File, dir string) error {
 	return nil
 }
 
+// record is the journal record that restores key's current state: its only version, its full version
+// list, or its absence. Callers hold s.mu.
+func (b *bucket) record(key string) record {
+	m, ok := b.objects[key]
+	switch {
+	case !ok:
+		return record{Del: key}
+	case len(b.versions[key]) == 0:
+		return record{Put: &m}
+	}
+	return record{Vers: &keyVersions{Key: key, List: append([]ObjectMeta{m}, b.versions[key]...)}}
+}
+
+// setVersions replaces key's versions with list, current first.
+func (b *bucket) setVersions(key string, list []ObjectMeta) {
+	delete(b.versions, key)
+	if len(list) == 0 {
+		delete(b.objects, key)
+		return
+	}
+	b.objects[key] = list[0]
+	if len(list) > 1 {
+		b.versions[key] = slices.Clone(list[1:])
+	}
+}
+
+// versioningStatus reads Enabled or Suspended from a stored VersioningConfiguration.
+func versioningStatus(config string) string {
+	var v struct{ Status string }
+	if config == "" || xml.Unmarshal([]byte(config), &v) != nil {
+		return ""
+	}
+	if v.Status == "Enabled" || v.Status == "Suspended" {
+		return v.Status
+	}
+	return ""
+}
+
+// matchesVersion reports whether m is the version a request names: "null" is the null version.
+func matchesVersion(m ObjectMeta, versionID string) bool {
+	return m.VersionID == versionID || versionID == "null" && m.VersionID == ""
+}
+
+// currentPath and versionPath are where a version's bytes live while it is current or noncurrent.
+func currentPath(base string, m ObjectMeta) string {
+	if m.Parts != nil {
+		return base + ".parts"
+	}
+	return base + ".bin"
+}
+
+func versionPath(base string, m ObjectMeta) string {
+	id := m.VersionID
+	if id == "" {
+		id = "null"
+	}
+	if m.Parts != nil {
+		return base + ".v-" + id + ".parts"
+	}
+	return base + ".v-" + id + ".bin"
+}
+
+// retireCurrent makes the current version of key noncurrent: its bytes move to the version's name.
+// Callers hold s.mu.
+func (b *bucket) retireCurrent(base, key string) error {
+	old, ok := b.objects[key]
+	if !ok {
+		return nil
+	}
+	if !old.DeleteMarker {
+		if err := os.Rename(currentPath(base, old), versionPath(base, old)); err != nil {
+			return err
+		}
+	}
+	delete(b.objects, key)
+	b.versions[key] = append([]ObjectMeta{old}, b.versions[key]...)
+	return nil
+}
+
+// dropNoncurrent removes the noncurrent version of key that versionID names and returns its bytes' path
+// for the caller to delete ("" for a delete marker or no match). Callers hold s.mu.
+func (b *bucket) dropNoncurrent(base, key, versionID string) (removed ObjectMeta, garbage string, found bool) {
+	list := b.versions[key]
+	for i, m := range list {
+		if !matchesVersion(m, versionID) {
+			continue
+		}
+		b.versions[key] = slices.Delete(list, i, i+1)
+		if len(b.versions[key]) == 0 {
+			delete(b.versions, key)
+		}
+		if !m.DeleteMarker {
+			garbage = discard(versionPath(base, m), m.Parts != nil)
+		}
+		return m, garbage, true
+	}
+	return ObjectMeta{}, "", false
+}
+
+// promote makes the newest noncurrent version of key current, after the current one was removed. Callers
+// hold s.mu.
+func (b *bucket) promote(base, key string) error {
+	list := b.versions[key]
+	if len(list) == 0 {
+		return nil
+	}
+	next := list[0]
+	if !next.DeleteMarker {
+		if err := os.Rename(versionPath(base, next), currentPath(base, next)); err != nil {
+			return err
+		}
+	}
+	b.setVersions(key, list)
+	return nil
+}
+
+// discard unlinks a version's bytes: a file at once, a parts directory by renaming it aside and returning
+// the new name for the caller to remove after releasing the lock.
+func discard(path string, parts bool) (garbage string) {
+	if !parts {
+		os.Remove(path)
+		return ""
+	}
+	garbage = path + ".trash-" + randomID()
+	if os.Rename(path, garbage) != nil {
+		return ""
+	}
+	return garbage
+}
+
 func journalLine(rec record) ([]byte, error) {
 	line, err := json.Marshal(rec)
 	return append(line, '\n'), err
@@ -267,7 +423,7 @@ func (s *Store) CreateBucket(name string) error {
 	if _, ok := s.buckets[name]; ok {
 		return ErrBucketExists
 	}
-	b := &bucket{meta: BucketMeta{Name: name, Created: time.Now().UTC()}, objects: map[string]ObjectMeta{}}
+	b := &bucket{meta: BucketMeta{Name: name, Created: time.Now().UTC()}, objects: map[string]ObjectMeta{}, versions: map[string][]ObjectMeta{}}
 	if err := os.MkdirAll(s.bucketDir(name), 0o755); err != nil {
 		return err
 	}
@@ -333,6 +489,7 @@ func (s *Store) UpdateBucket(name string, update func(*BucketMeta)) error {
 		return ErrNoSuchBucket
 	}
 	update(&b.meta)
+	b.versioning = versioningStatus(b.meta.Configs["versioning"])
 	return s.writeJSON(filepath.Join(s.bucketDir(name), ".bucket.json"), b.meta)
 }
 
@@ -386,8 +543,11 @@ func (s *Store) PutObject(bucketName string, meta ObjectMeta, body io.Reader, co
 
 // publish moves data (a file, or a directory of parts when meta.Parts is set) into place and journals meta.
 // The lock covers only renames and one append; whatever the new version replaces is deleted afterwards.
+// With versioning enabled the replaced version is kept under its version name instead; suspended
+// versioning replaces only the null version.
 func (s *Store) publish(bucketName string, meta ObjectMeta, data string, cond Precondition) (ObjectMeta, error) {
 	meta.LastModified = time.Now().UTC().Truncate(time.Millisecond)
+	meta.VersionID, meta.DeleteMarker = "", false
 	line, err := journalLine(record{Put: &meta})
 	if err != nil {
 		return ObjectMeta{}, err
@@ -399,31 +559,48 @@ func (s *Store) publish(bucketName string, meta ObjectMeta, data string, cond Pr
 		return ObjectMeta{}, ErrNoSuchBucket
 	}
 	old, exists := b.objects[meta.Key]
-	if err := cond.check(old, exists); err != nil {
+	if err := cond.check(old, exists && !old.DeleteMarker); err != nil {
 		s.mu.Unlock()
 		return ObjectMeta{}, err
 	}
 	base := objectBase(s.bucketDir(bucketName), meta.Key)
-	var garbage string
-	if exists && (old.Parts != nil || meta.Parts != nil) {
-		garbage = s.unlinkData(base, old) // a file-over-file rename replaces atomically on its own
+	var garbage []string
+	switch {
+	case b.versioning == "Enabled":
+		meta.VersionID = randomID()
+		err = b.retireCurrent(base, meta.Key)
+	case b.versioning == "Suspended" && exists && old.VersionID != "":
+		err = b.retireCurrent(base, meta.Key)
+	case exists && !old.DeleteMarker && (old.Parts != nil || meta.Parts != nil):
+		garbage = append(garbage, s.unlinkData(base, old)) // a file-over-file rename replaces atomically on its own
 	}
-	target := base + ".bin"
-	if meta.Parts != nil {
-		target = base + ".parts"
+	if err == nil && b.versioning == "Suspended" {
+		_, g, _ := b.dropNoncurrent(base, meta.Key, "null") // the null version is replaced, wherever it is
+		garbage = append(garbage, g)
 	}
-	if err := os.Rename(data, target); err != nil {
+	if err == nil {
+		err = os.Rename(data, currentPath(base, meta))
+	}
+	if err != nil {
 		s.mu.Unlock()
 		return ObjectMeta{}, err
 	}
-	log, err := s.appendRecord(bucketName, b, line)
 	b.objects[meta.Key] = meta
+	if b.versioning != "" {
+		line, err = journalLine(b.record(meta.Key))
+	}
+	var log *os.File
+	if err == nil {
+		log, err = s.appendRecord(bucketName, b, line)
+	}
 	s.mu.Unlock()
 	if err == nil {
 		err = s.commit(log, s.bucketDir(bucketName))
 	}
-	if garbage != "" {
-		os.RemoveAll(garbage)
+	for _, g := range garbage {
+		if g != "" {
+			os.RemoveAll(g)
+		}
 	}
 	return meta, err
 }
@@ -442,23 +619,49 @@ func (s *Store) unlinkData(base string, m ObjectMeta) (garbage string) {
 	return garbage
 }
 
+// HeadObject returns the current version of key. A current delete marker is ErrNoSuchKey, returned with
+// the marker's metadata.
 func (s *Store) HeadObject(bucketName, key string) (ObjectMeta, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.head(bucketName, key)
+	return s.Version(bucketName, key, "")
 }
 
-// head looks up an object's metadata. Callers hold s.mu.
-func (s *Store) head(bucketName, key string) (ObjectMeta, error) {
+// Version returns one version of key: "" for the current one, "null" for the null version. A delete
+// marker named by its version ID is ErrDeleteMarker, returned with the marker's metadata.
+func (s *Store) Version(bucketName, key, versionID string) (ObjectMeta, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	m, _, err := s.find(bucketName, key, versionID)
+	return m, err
+}
+
+// find locates a version and the path of its bytes. Callers hold s.mu.
+func (s *Store) find(bucketName, key, versionID string) (ObjectMeta, string, error) {
 	b, ok := s.buckets[bucketName]
 	if !ok {
-		return ObjectMeta{}, ErrNoSuchBucket
+		return ObjectMeta{}, "", ErrNoSuchBucket
 	}
+	base := objectBase(s.bucketDir(bucketName), key)
 	m, ok := b.objects[key]
-	if !ok {
-		return ObjectMeta{}, ErrNoSuchKey
+	switch {
+	case versionID == "" && ok && m.DeleteMarker:
+		return m, "", ErrNoSuchKey
+	case versionID == "" && ok, ok && matchesVersion(m, versionID):
+		if m.DeleteMarker {
+			return m, "", ErrDeleteMarker
+		}
+		return m, currentPath(base, m), nil
+	case versionID == "":
+		return ObjectMeta{}, "", ErrNoSuchKey
 	}
-	return m, nil
+	for _, v := range b.versions[key] {
+		if matchesVersion(v, versionID) {
+			if v.DeleteMarker {
+				return v, "", ErrDeleteMarker
+			}
+			return v, versionPath(base, v), nil
+		}
+	}
+	return ObjectMeta{}, "", ErrNoSuchVersion
 }
 
 // Object is an open object body. Single-file objects are an *os.File, so GET keeps the sendfile path.
@@ -467,49 +670,54 @@ type Object interface {
 	io.Closer
 }
 
-// OpenObject returns the metadata and the opened body; the caller closes it. Files are opened under the
-// read lock, so a concurrent overwrite or delete cannot pull them away mid-read.
+// OpenObject opens the current version of key; see OpenVersion.
 func (s *Store) OpenObject(bucketName, key string) (ObjectMeta, Object, error) {
+	return s.OpenVersion(bucketName, key, "")
+}
+
+// OpenVersion returns a version's metadata and its opened body; the caller closes it. Files are opened under
+// the read lock, so a concurrent overwrite or delete cannot pull them away mid-read. Errors are Version's.
+func (s *Store) OpenVersion(bucketName, key, versionID string) (ObjectMeta, Object, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	b, ok := s.buckets[bucketName]
-	if !ok {
-		return ObjectMeta{}, nil, ErrNoSuchBucket
+	m, path, err := s.find(bucketName, key, versionID)
+	if err != nil {
+		return m, nil, err
 	}
-	m, ok := b.objects[key]
-	if !ok {
-		return ObjectMeta{}, nil, ErrNoSuchKey
-	}
-	base := objectBase(s.bucketDir(bucketName), key)
 	if m.Parts == nil {
-		f, err := os.Open(base + ".bin")
+		f, err := os.Open(path)
 		return m, f, err
 	}
-	pr, err := openParts(base+".parts", m.Parts)
+	pr, err := openParts(path, m.Parts)
 	return m, pr, err
 }
 
-// UpdateObject rewrites an object's metadata (tags, ACL) without touching its bytes.
-func (s *Store) UpdateObject(bucketName, key string, update func(*ObjectMeta)) error {
+// UpdateObject rewrites a version's metadata (tags, ACL) without touching its bytes; versionID as in
+// Version.
+func (s *Store) UpdateObject(bucketName, key, versionID string, update func(*ObjectMeta)) error {
 	s.mu.Lock()
-	b, ok := s.buckets[bucketName]
-	if !ok {
+	m, _, err := s.find(bucketName, key, versionID)
+	if err != nil {
 		s.mu.Unlock()
-		return ErrNoSuchBucket
+		return err
 	}
-	m, ok := b.objects[key]
-	if !ok {
-		s.mu.Unlock()
-		return ErrNoSuchKey
-	}
+	b := s.buckets[bucketName]
 	update(&m)
-	line, err := journalLine(record{Put: &m})
+	if cur := b.objects[key]; cur.VersionID == m.VersionID {
+		b.objects[key] = m
+	} else {
+		for i, v := range b.versions[key] {
+			if v.VersionID == m.VersionID {
+				b.versions[key][i] = m
+			}
+		}
+	}
+	line, err := journalLine(b.record(key))
 	if err != nil {
 		s.mu.Unlock()
 		return err
 	}
 	log, err := s.appendRecord(bucketName, b, line)
-	b.objects[key] = m
 	s.mu.Unlock()
 	if err == nil {
 		err = s.commit(log, s.bucketDir(bucketName))
@@ -517,39 +725,116 @@ func (s *Store) UpdateObject(bucketName, key string, update func(*ObjectMeta)) e
 	return err
 }
 
-// DeleteObject is idempotent like S3: deleting a missing key succeeds.
-func (s *Store) DeleteObject(bucketName, key string) error {
-	line, err := journalLine(record{Del: key})
-	if err != nil {
-		return err
-	}
+// Deleted describes what a delete did: the version it removed or the delete marker it created.
+type Deleted struct {
+	VersionID    string // "" when versioning was never enabled; "null" for the null version
+	DeleteMarker bool
+}
+
+// DeleteObject deletes key as S3 does without a version ID: idempotently, and with versioning by adding a
+// delete marker (a null one when versioning is suspended) instead of removing bytes.
+func (s *Store) DeleteObject(bucketName, key string) (Deleted, error) {
 	s.mu.Lock()
 	b, ok := s.buckets[bucketName]
 	if !ok {
 		s.mu.Unlock()
-		return ErrNoSuchBucket
+		return Deleted{}, ErrNoSuchBucket
 	}
-	old, ok := b.objects[key]
+	base := objectBase(s.bucketDir(bucketName), key)
+	old, exists := b.objects[key]
+	var garbage []string
+	var out Deleted
+	var err error
+	switch b.versioning {
+	case "":
+		if !exists {
+			s.mu.Unlock()
+			return Deleted{}, nil
+		}
+		garbage = append(garbage, s.unlinkData(base, old))
+		delete(b.objects, key)
+	default:
+		marker := ObjectMeta{Key: key, DeleteMarker: true, LastModified: time.Now().UTC().Truncate(time.Millisecond)}
+		if b.versioning == "Enabled" {
+			marker.VersionID = randomID()
+		}
+		switch {
+		case exists && marker.VersionID == "" && old.VersionID == "":
+			if !old.DeleteMarker {
+				garbage = append(garbage, discard(currentPath(base, old), old.Parts != nil))
+			}
+			delete(b.objects, key)
+		case exists:
+			err = b.retireCurrent(base, key)
+		}
+		if err == nil && marker.VersionID == "" {
+			_, g, _ := b.dropNoncurrent(base, key, "null")
+			garbage = append(garbage, g)
+		}
+		if err == nil {
+			b.objects[key] = marker
+		}
+		out = Deleted{VersionID: cmp.Or(marker.VersionID, "null"), DeleteMarker: true}
+	}
+	return out, s.journalChange(bucketName, b, key, err, garbage)
+}
+
+// DeleteVersion permanently removes one version of key ("null" for the null version). Removing the current
+// version makes the newest remaining one current. A missing version is not an error.
+func (s *Store) DeleteVersion(bucketName, key, versionID string) (Deleted, error) {
+	s.mu.Lock()
+	b, ok := s.buckets[bucketName]
 	if !ok {
 		s.mu.Unlock()
-		return nil
+		return Deleted{}, ErrNoSuchBucket
 	}
-	garbage := s.unlinkData(objectBase(s.bucketDir(bucketName), key), old)
-	delete(b.objects, key)
-	log, err := s.appendRecord(bucketName, b, line)
+	base := objectBase(s.bucketDir(bucketName), key)
+	out := Deleted{VersionID: versionID}
+	var garbage []string
+	var err error
+	if cur, ok := b.objects[key]; ok && matchesVersion(cur, versionID) {
+		out.DeleteMarker = cur.DeleteMarker
+		if !cur.DeleteMarker {
+			garbage = append(garbage, discard(currentPath(base, cur), cur.Parts != nil))
+		}
+		delete(b.objects, key)
+		err = b.promote(base, key)
+	} else if removed, g, found := b.dropNoncurrent(base, key, versionID); found {
+		out.DeleteMarker = removed.DeleteMarker
+		garbage = append(garbage, g)
+	} else {
+		s.mu.Unlock()
+		return out, nil
+	}
+	return out, s.journalChange(bucketName, b, key, err, garbage)
+}
+
+// journalChange appends key's new state to the journal, releases s.mu (which the caller holds), makes the
+// change durable and removes garbage.
+func (s *Store) journalChange(bucketName string, b *bucket, key string, err error, garbage []string) error {
+	var log *os.File
+	if err == nil {
+		var line []byte
+		if line, err = journalLine(b.record(key)); err == nil {
+			log, err = s.appendRecord(bucketName, b, line)
+		}
+	}
 	s.mu.Unlock()
 	if err == nil {
 		err = s.commit(log, s.bucketDir(bucketName))
 	}
-	if garbage != "" {
-		os.RemoveAll(garbage)
+	for _, g := range garbage {
+		if g != "" {
+			os.RemoveAll(g)
+		}
 	}
 	return err
 }
 
-// CopyObject copies an object server-side. When replace is nil the source metadata is kept (COPY
-// directive). A single-file source is hard-linked, so the copy costs no data I/O.
-func (s *Store) CopyObject(srcBucket, srcKey, dstBucket, dstKey string, replace *ObjectMeta) (ObjectMeta, error) {
+// CopyObject copies a version of an object (versionID as in Version) server-side. When replace is nil the
+// source metadata is kept (COPY directive). A single-file source is hard-linked, so the copy costs no data
+// I/O.
+func (s *Store) CopyObject(srcBucket, srcKey, srcVersionID, dstBucket, dstKey string, replace *ObjectMeta) (ObjectMeta, error) {
 	if _, err := s.Bucket(dstBucket); err != nil {
 		return ObjectMeta{}, err
 	}
@@ -557,8 +842,8 @@ func (s *Store) CopyObject(srcBucket, srcKey, dstBucket, dstKey string, replace 
 	// the old size and ETag with the new bytes.
 	tmp := filepath.Join(s.bucketDir(dstBucket), ".put-"+randomID())
 	s.mu.RLock()
-	src, err := s.head(srcBucket, srcKey)
-	linked := err == nil && src.Parts == nil && os.Link(objectBase(s.bucketDir(srcBucket), srcKey)+".bin", tmp) == nil
+	src, path, err := s.find(srcBucket, srcKey, srcVersionID)
+	linked := err == nil && src.Parts == nil && os.Link(path, tmp) == nil
 	s.mu.RUnlock()
 	if err != nil {
 		return ObjectMeta{}, err
@@ -576,7 +861,7 @@ func (s *Store) CopyObject(srcBucket, srcKey, dstBucket, dstKey string, replace 
 		os.Remove(tmp)
 		return out, err
 	}
-	_, f, err := s.OpenObject(srcBucket, srcKey)
+	_, f, err := s.OpenVersion(srcBucket, srcKey, srcVersionID)
 	if err != nil {
 		return ObjectMeta{}, err
 	}
@@ -602,7 +887,7 @@ func (s *Store) List(bucketName, prefix, delimiter, after string, max int) (List
 	}
 	metas := make([]ObjectMeta, 0, len(b.objects))
 	for k, m := range b.objects {
-		if strings.HasPrefix(k, prefix) && k > after {
+		if strings.HasPrefix(k, prefix) && k > after && !m.DeleteMarker {
 			metas = append(metas, m)
 		}
 	}
@@ -643,6 +928,86 @@ func (s *Store) List(bucketName, prefix, delimiter, after string, max int) (List
 	return res, nil
 }
 
+// VersionsResult is one page of ListObjectVersions: every version and delete marker in key order, newest
+// first within a key.
+type VersionsResult struct {
+	Versions            []ObjectVersion
+	CommonPrefixes      []string
+	Truncated           bool
+	NextKeyMarker       string
+	NextVersionIDMarker string
+}
+
+type ObjectVersion struct {
+	ObjectMeta
+	IsLatest bool
+}
+
+// ListVersions pages through versions like List pages through keys. A page resumes after keyMarker, or
+// within it after versionIDMarker ("null" for the null version).
+func (s *Store) ListVersions(bucketName, prefix, delimiter, keyMarker, versionIDMarker string, max int) (VersionsResult, error) {
+	s.mu.RLock()
+	b, ok := s.buckets[bucketName]
+	if !ok {
+		s.mu.RUnlock()
+		return VersionsResult{}, ErrNoSuchBucket
+	}
+	var keys []string
+	for k := range b.objects {
+		if strings.HasPrefix(k, prefix) && k >= keyMarker {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	var res VersionsResult
+	seen := map[string]bool{}
+	full := func() bool {
+		if len(res.Versions)+len(res.CommonPrefixes) < max {
+			return false
+		}
+		res.Truncated = true
+		return true
+	}
+	for _, k := range keys {
+		if delimiter != "" {
+			if i := strings.Index(k[len(prefix):], delimiter); i >= 0 {
+				cp := k[:len(prefix)+i+len(delimiter)]
+				if seen[cp] || cp <= keyMarker {
+					continue
+				}
+				if full() {
+					break
+				}
+				seen[cp] = true
+				res.CommonPrefixes = append(res.CommonPrefixes, cp)
+				res.NextKeyMarker, res.NextVersionIDMarker = cp, "" // resuming at cp skips every key under it
+				continue
+			}
+		}
+		list := append([]ObjectMeta{b.objects[k]}, b.versions[k]...)
+		skip := k == keyMarker // a page that ended inside this key resumes after versionIDMarker
+		for i, v := range list {
+			if skip {
+				skip = versionIDMarker == "" || !matchesVersion(v, versionIDMarker)
+				if versionIDMarker == "" {
+					break
+				}
+				continue
+			}
+			if full() {
+				break
+			}
+			res.Versions = append(res.Versions, ObjectVersion{v, i == 0})
+			res.NextKeyMarker, res.NextVersionIDMarker = k, cmp.Or(v.VersionID, "null")
+		}
+		if res.Truncated {
+			break
+		}
+	}
+	s.mu.RUnlock()
+	return res, nil
+}
+
 // --- multipart ---
 
 type upload struct {
@@ -652,9 +1017,10 @@ type upload struct {
 }
 
 type Part struct {
-	Number int
-	ETag   string
-	Size   int64
+	Number       int
+	ETag         string
+	Size         int64
+	LastModified time.Time
 }
 
 func (s *Store) uploadDir(id string) string { return filepath.Join(s.root, ".uploads", id) }
@@ -778,7 +1144,7 @@ func (s *Store) parts(id string) (map[int]storedPart, error) {
 		if err != nil {
 			continue // replaced while listing
 		}
-		out[n] = storedPart{Part{Number: n, ETag: `"` + sum + `"`, Size: info.Size()}, filepath.Join(s.uploadDir(id), e.Name())}
+		out[n] = storedPart{Part{Number: n, ETag: `"` + sum + `"`, Size: info.Size(), LastModified: info.ModTime().UTC()}, filepath.Join(s.uploadDir(id), e.Name())}
 	}
 	return out, nil
 }
@@ -801,10 +1167,17 @@ func (s *Store) ListParts(bucketName, key, id string) ([]Part, error) {
 
 // CompleteUpload moves the requested parts into the object's parts directory — no bytes are copied. The
 // resulting ETag follows S3: md5(concat(md5(part)...)) + "-" + count.
-func (s *Store) CompleteUpload(bucketName, key, id string, requested []Part) (ObjectMeta, error) {
+func (s *Store) CompleteUpload(bucketName, key, id string, requested []Part, cond Precondition) (ObjectMeta, error) {
 	u, err := s.loadUpload(bucketName, key, id)
 	if err != nil {
 		return ObjectMeta{}, err
+	}
+	// Checked here so a failed condition leaves the upload intact for a retry; publish checks again under
+	// the lock that makes it atomic.
+	if old, err := s.HeadObject(bucketName, key); cond != (Precondition{}) {
+		if err := cond.check(old, err == nil); err != nil {
+			return ObjectMeta{}, err
+		}
 	}
 	stored, err := s.parts(id)
 	if err != nil {
@@ -843,7 +1216,7 @@ func (s *Store) CompleteUpload(bucketName, key, id string, requested []Part) (Ob
 		return ObjectMeta{}, err
 	}
 	meta.ETag = fmt.Sprintf(`"%s-%d"`, hex.EncodeToString(etags.Sum(nil)), len(requested))
-	out, err := s.publish(bucketName, meta, dir, Precondition{})
+	out, err := s.publish(bucketName, meta, dir, cond)
 	if err != nil {
 		os.RemoveAll(dir)
 		return ObjectMeta{}, err

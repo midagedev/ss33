@@ -36,11 +36,12 @@ func storedContentEncoding(v string) string {
 }
 
 // chunkedReader decodes `<hex-size>[;chunk-signature=...]\r\n<data>\r\n ... 0[;...]\r\n[trailers]\r\n`.
-// Chunk signatures and trailing checksums are not verified.
+// Chunk signatures are not verified; trailers (the SDKs' trailing checksums) are kept for digestReader.
 type chunkedReader struct {
 	r         *bufio.Reader
 	remaining int64
 	done      bool
+	trailers  map[string]string // lowercased name -> value
 }
 
 func newChunkedReader(r io.Reader) *chunkedReader {
@@ -63,11 +64,15 @@ func (c *chunkedReader) Read(p []byte) (int, error) {
 		}
 		if size == 0 {
 			c.done = true
-			// Drain trailers up to the blank line; the payload is complete either way.
+			// Read trailers up to the blank line; the payload is complete either way.
+			c.trailers = map[string]string{}
 			for {
 				l, err := c.r.ReadString('\n')
 				if err != nil || strings.TrimRight(l, "\r\n") == "" {
 					break
+				}
+				if name, value, ok := strings.Cut(strings.TrimRight(l, "\r\n"), ":"); ok {
+					c.trailers[strings.ToLower(strings.TrimSpace(name))] = strings.TrimSpace(value)
 				}
 			}
 			return 0, io.EOF

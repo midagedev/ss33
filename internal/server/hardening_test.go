@@ -5,6 +5,8 @@ package server_test
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"strings"
@@ -159,5 +161,37 @@ func TestAnonymousWritesFollowPolicy(t *testing.T) {
 		if got := anon(step.method, step.path); got != step.want {
 			t.Errorf("anonymous %s %s: %d, want %d", step.method, step.path, got, step.want)
 		}
+	}
+}
+
+// A body that does not match its declared Content-MD5 or x-amz-checksum-* is refused and not stored, as
+// S3 does; integrity tests depend on it.
+func TestDeclaredDigestsAreChecked(t *testing.T) {
+	ctx := context.Background()
+	_, c := newServer(t)
+	mustBucket(t, c, "bkt")
+	wrongMD5 := base64.StdEncoding.EncodeToString(md5.New().Sum(nil)) // the MD5 of nothing
+	for _, tc := range []struct {
+		name string
+		in   *s3.PutObjectInput
+		code string
+	}{
+		{"wrong Content-MD5", &s3.PutObjectInput{ContentMD5: aws.String(wrongMD5)}, "BadDigest"},
+		{"malformed Content-MD5", &s3.PutObjectInput{ContentMD5: aws.String("nope")}, "InvalidDigest"},
+		{"wrong CRC32", &s3.PutObjectInput{ChecksumCRC32: aws.String("AAAAAA==")}, "BadDigest"},
+		{"wrong SHA256", &s3.PutObjectInput{ChecksumSHA256: aws.String(base64.StdEncoding.EncodeToString(make([]byte, 32)))}, "BadDigest"},
+	} {
+		tc.in.Bucket, tc.in.Key, tc.in.Body = aws.String("bkt"), aws.String("k"), strings.NewReader("payload")
+		if _, err := c.PutObject(ctx, tc.in); errCode(err) != tc.code {
+			t.Errorf("%s: want %s, got %v", tc.name, tc.code, err)
+		}
+	}
+	if _, err := c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String("bkt"), Key: aws.String("k")}); errCode(err) != "NotFound" {
+		t.Fatalf("an upload with a bad digest was stored: %v", err)
+	}
+	sum := md5.Sum([]byte("payload"))
+	if _, err := c.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String("bkt"), Key: aws.String("k"), Body: strings.NewReader("payload"),
+		ContentMD5: aws.String(base64.StdEncoding.EncodeToString(sum[:]))}); err != nil {
+		t.Fatalf("correct Content-MD5: %v", err)
 	}
 }

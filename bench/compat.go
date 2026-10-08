@@ -226,6 +226,59 @@ func compatChecks(c *s3.Client, ep, ak, sk, b string) []struct {
 			}
 			return err
 		}},
+		{"Versioning keeps old versions and delete markers", func() error {
+			vb, key := b+"-ver", str("versioned.txt")
+			var ids []string
+			for _, body := range []string{"one", "two"} {
+				out, err := c.PutObject(ctx, &s3.PutObjectInput{Bucket: &vb, Key: key, Body: strings.NewReader(body)})
+				if err != nil {
+					return err
+				}
+				ids = append(ids, aws.ToString(out.VersionId))
+			}
+			old, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: &vb, Key: key, VersionId: &ids[0]})
+			if err != nil {
+				return fmt.Errorf("GET first version: %w", err)
+			}
+			body, _ := io.ReadAll(old.Body)
+			old.Body.Close()
+			if string(body) != "one" {
+				return fmt.Errorf("first version reads %q", body)
+			}
+			if _, err := c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &vb, Key: key}); err != nil {
+				return err
+			}
+			if _, err := c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &vb, Key: key}); err == nil {
+				return errors.New("key still readable after delete")
+			}
+			lv, err := c.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: &vb, Prefix: key})
+			if err == nil && (len(lv.Versions) != 2 || len(lv.DeleteMarkers) != 1) {
+				err = fmt.Errorf("%d versions, %d delete markers listed", len(lv.Versions), len(lv.DeleteMarkers))
+			}
+			return err
+		}},
+		{"ListParts paging fields (Docker registry)", func() error {
+			up, err := c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &b, Key: str("parts")})
+			if err != nil {
+				return err
+			}
+			for n := int32(1); n <= 2; n++ {
+				if _, err := c.UploadPart(ctx, &s3.UploadPartInput{Bucket: &b, Key: str("parts"), UploadId: up.UploadId, PartNumber: &n,
+					Body: strings.NewReader("part")}); err != nil {
+					return err
+				}
+			}
+			out, err := c.ListParts(ctx, &s3.ListPartsInput{Bucket: &b, Key: str("parts"), UploadId: up.UploadId, MaxParts: aws.Int32(1)})
+			switch {
+			case err != nil:
+				return err
+			case out.IsTruncated == nil || out.NextPartNumberMarker == nil:
+				return errors.New("IsTruncated or NextPartNumberMarker missing")
+			case len(out.Parts) != 1 || !aws.ToBool(out.IsTruncated):
+				return fmt.Errorf("max-parts 1 returned %d parts, truncated %v", len(out.Parts), aws.ToBool(out.IsTruncated))
+			}
+			return nil
+		}},
 		{"Put/GetBucketCors", func() error {
 			if _, err := c.PutBucketCors(ctx, &s3.PutBucketCorsInput{Bucket: &b, CORSConfiguration: &types.CORSConfiguration{
 				CORSRules: []types.CORSRule{{AllowedOrigins: []string{"*"}, AllowedMethods: []string{"GET", "PUT"}}}}}); err != nil {

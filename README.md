@@ -7,8 +7,10 @@
 
 **A drop-in replacement for the `minio/minio` and `minio/mc` images in local dev and CI.**
 A small S3-compatible server and an `mc`-compatible CLI in one image: 10 MB, healthy in about 170 ms, 2 MiB
-of memory at idle. On the same CI runner it serves 2–4× MinIO's small-object requests per second, and
-1.5–2.4× with fsync on ([numbers](#numbers)).
+of memory at idle. On the same CI runner it serves 1.8–3.3× MinIO's small-object requests per second, and
+1.6–2× with fsync on ([numbers](#numbers)). Versioning, webhook notifications and virtual-hosted buckets work,
+and CI runs the Docker registry, Terraform, the official `mc` and five AWS SDKs and tools against every
+commit ([tested clients](#tested-clients)).
 
 ## Why
 
@@ -24,7 +26,7 @@ Change the two `image:` lines. Leave `command`, `environment` and `healthcheck` 
  services:
    minio:
 -    image: minio/minio
-+    image: ghcr.io/midagedev/ss33:0.3
++    image: ghcr.io/midagedev/ss33:0.4
      command: server /data --console-address ":9001"
      environment:
        MINIO_ROOT_USER: minioadmin
@@ -34,7 +36,7 @@ Change the two `image:` lines. Leave `command`, `environment` and `healthcheck` 
 
    createbuckets:
 -    image: minio/mc
-+    image: ghcr.io/midagedev/ss33:0.3
++    image: ghcr.io/midagedev/ss33:0.4
      depends_on:
        minio:
          condition: service_healthy
@@ -52,6 +54,8 @@ These carry over unchanged:
 - **Credentials:** `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`, or the legacy `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`.
   With none set, MinIO's defaults `minioadmin` / `minioadmin` apply.
 - **Health:** `/minio/health/live`, `/minio/health/ready`, `/minio/health/cluster` and `/healthz`. `curl` is in the image.
+- **Notifications and domains:** `MINIO_NOTIFY_WEBHOOK_*` targets with `mc event add`, and `MINIO_DOMAIN` for
+  virtual-hosted buckets.
 - **mc:** `mc` is at `/usr/bin/mc` and `/usr/local/bin/mc`, and `/bin/sh` is available for `entrypoint: /bin/sh -c "..."` scripts.
 
 There are three things to watch for:
@@ -65,7 +69,7 @@ There are three things to watch for:
 ## Quick start
 
 ```sh
-docker run -d -p 9000:9000 ghcr.io/midagedev/ss33:0.3    # credentials: minioadmin / minioadmin, as MinIO
+docker run -d -p 9000:9000 ghcr.io/midagedev/ss33:0.4    # credentials: minioadmin / minioadmin, as MinIO
 ```
 
 ```sh
@@ -91,7 +95,7 @@ Point SDKs at the endpoint with path-style addressing, for example `forcePathSty
 accepts. In Java, declare the substitution:
 
 ```java
-new MinIOContainer(DockerImageName.parse("ghcr.io/midagedev/ss33:0.3").asCompatibleSubstituteFor("minio/minio"))
+new MinIOContainer(DockerImageName.parse("ghcr.io/midagedev/ss33:0.4").asCompatibleSubstituteFor("minio/minio"))
 ```
 
 In Go, Python and Node, pass the image name where the module takes one.
@@ -112,23 +116,23 @@ for ops/s and MiB/s; lower is better for ms. The [Benchmark workflow](.github/wo
 
 | Test | ss33 | ss33 --durable | MinIO | RustFS 1.0.1 | SeaweedFS 4.48 | versitygw 1.8.0 |
 |---|---:|---:|---:|---:|---:|---:|
-| PUT 4 KiB, 16 concurrent (ops/s) | **7,008** | 3,563 | 2,334 | 1,277 | 1,986 | 3,180 |
-| GET 4 KiB, 16 concurrent (ops/s) | 10,522 | **11,380** | 4,658 | 6,042 | 4,897 | 4,050 |
-| HEAD, 16 concurrent (ops/s) | **13,764** | 13,690 | 5,812 | 9,189 | 6,733 | 4,258 |
-| PUT 256 MiB, best of 3 (MiB/s) | **353** | 154 | 152 | 117 | 240 | 255 |
-| GET 256 MiB, best of 3 (MiB/s) | 3,320 | 3,191 | 1,946 | 1,487 | 1,537 | **3,614** |
-| UploadPart 32 × 8 MiB, 32 concurrent (MiB/s) | **991** | 195 | 193 | 171 | 239 | 700 |
-| ListParts, 32 parts (ms) | **0.7** | 0.9 | 2.0 | 2.5 | 3.3 | 2.1 |
-| CompleteMultipartUpload, 256 MiB (ms) | **1.1** | 2.2 | 3.8 | 8.0 | 15.8 | 114.0 |
-| PUT 0 B × 20,000, 32 concurrent (ops/s) | **9,572** | 3,732 | 2,366 | 1,312 | 5,613 | 3,734 |
-| ListObjectsV2, all 20,000 keys (ms) | 249.5 | **243.8** | 631.2 | 2,478.8 | 324.1 | 526.7 |
-| ListObjectsV2, one prefix page (ms) | 2.0 | **2.0** | 2.4 | 7.4 | 2.0 | 2.1 |
+| PUT 4 KiB, 16 concurrent (ops/s) | **4,490** | 2,695 | 1,658 | 946 | 1,987 | 2,073 |
+| GET 4 KiB, 16 concurrent (ops/s) | 6,894 | **7,024** | 3,556 | 4,262 | 3,421 | 2,647 |
+| HEAD, 16 concurrent (ops/s) | 7,846 | **8,395** | 4,372 | 6,733 | 5,101 | 2,792 |
+| PUT 256 MiB, best of 3 (MiB/s) | **278** | 195 | 223 | 179 | 239 | 240 |
+| GET 256 MiB, best of 3 (MiB/s) | 1,808 | 1,900 | 1,641 | 1,370 | 1,426 | **2,018** |
+| UploadPart 32 × 8 MiB, 32 concurrent (MiB/s) | **785** | 525 | 490 | 392 | 344 | 564 |
+| ListParts, 32 parts (ms) | **1.2** | 1.3 | 3.0 | 3.1 | 3.5 | 2.3 |
+| CompleteMultipartUpload, 256 MiB (ms) | **1.8** | 2.8 | 5.7 | 11.7 | 20.0 | 115.4 |
+| PUT 0 B × 20,000, 32 concurrent (ops/s) | **5,291** | 3,087 | 1,628 | 952 | 3,384 | 2,437 |
+| ListObjectsV2, all 20,000 keys (ms) | 346.8 | **330.9** | 786.8 | 3,296.7 | 480.6 | 833.9 |
+| ListObjectsV2, one prefix page (ms) | 3.0 | 2.6 | 3.8 | 10.1 | **2.5** | 3.0 |
 
 MinIO is built from source (the last published module version, 2026-02-12), since its images are gone. The
 others are their published images with default settings. MinIO and RustFS fsync before acknowledging a write;
 ss33, SeaweedFS and versitygw do not by default, so `ss33 --durable` is the column to compare with MinIO
-and RustFS. Shared runners are noisy: across four runs PUT 4 KiB ranged from 4,577 to
-7,839 ops/s for ss33, but the ranking did not change.
+and RustFS. Shared runners are noisy: across the last six runs ss33's PUT 4 KiB ranged from 4,387 to
+7,839 ops/s, and the ranking did not change.
 
 ### Feature checks
 
@@ -146,26 +150,31 @@ commonly lean on beyond plain PUT/GET, each driven through aws-sdk-go-v2.
 | Object tagging | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Conditional PUT (`If-None-Match: *`) | ✓ | ✓ | ✓ | ✓ | ✓ |
 | CRC64NVME checksum (AWS CLI v2's default) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Content-MD5 mismatch rejected (`BadDigest`) | ✓ | ✓ | ✓ | ✓ | ✓ |
 | UploadPartCopy | ✓ | ✓ | ✓ | ✓ | ✓ |
 | ListMultipartUploads | ✓ | ✓ | ✓ | ✓ | ✓ |
+| ListParts paging fields (the Docker registry needs them) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| GetObject `partNumber` (multipart downloaders) | ✓ | ✓ | ✓ | ✓ | ✓ |
 | ListObjectVersions | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Put/GetBucketVersioning | ✓¹ | ✓ | ✓ | ✓ | ✗³ |
+| Put/GetBucketVersioning | ✓ | ✓ | ✓ | ✓ | ✗³ |
+| Versioning keeps old versions and delete markers | ✓ | ✓ | ✓ | ✓ | ✗³ |
+| SSE-S3 header returned on PUT and HEAD | ✓¹ | ✗³ | ✗³ | ✓ | ✗ |
 | Put/GetBucketCors | ✓¹ | ✗ | ✓ | ✓ | ✓ |
 | Put/GetBucketLifecycleConfiguration | ✓¹ | ✓ | ✓ | ✓ | ✗ |
 | Put/GetBucketEncryption | ✓¹ | ✗³ | ✓ | ✓ | ✗ |
 | Put/GetBucketTagging | ✓ | ✓ | ✓ | ✓ | ✓ |
 | GetObjectAttributes | ✓ | ✓ | ✓ | ✓ | ✓ |
 
-¹ Stored and returned so bootstrap scripts finish, but not enforced: no old versions are kept, nothing
-expires, nothing is encrypted, and CORS stays open to every origin. The checks test that a call succeeds and
-round-trips, not what a full server does with it.
+¹ Stored and returned so bootstrap scripts and Terraform finish, but not enforced: nothing expires, nothing
+is encrypted, and CORS stays open to every origin. The checks test that a call succeeds and round-trips, not
+what a full server does with it.
 
 ² Real S3 disables ACLs on new buckets by default since 2023, and MinIO accepts the header but ignores it.
 ss33 follows the older behaviour so that code written for it still works in tests.
 
-³ Off in the default configuration rather than missing: MinIO's bucket encryption needs a KMS, and
-versitygw's versioning needs a versioning directory. Failure details for every ✗ are in the workflow's
-job summary.
+³ Off in the default configuration rather than missing: MinIO's encryption needs a KMS, RustFS's SSE-S3
+needs `RUSTFS_SSE_S3_MASTER_KEY`, and versitygw's versioning needs a versioning directory. Failure details
+for every ✗ are in the workflow's job summary.
 
 ### Footprint
 
@@ -207,7 +216,9 @@ One Go binary, standard library only. Each object is a plain file named by the S
 each bucket has an append-only metadata journal that is replayed into memory at startup. There is no
 database, so a PUT costs one data file plus one appended line, and HEAD and LIST never touch the disk.
 GET hands the file to the kernel with `sendfile`. CompleteMultipartUpload moves the part files into
-place instead of concatenating them, and CopyObject hard-links the source where it can. Nothing is fsynced
+place instead of concatenating them, and CopyObject hard-links the source where it can. In a versioned
+bucket the current version keeps that plain file name and older versions are renamed beside it, so
+reading the latest version costs the same as anywhere else. Nothing is fsynced
 unless `--durable` is set; then object data, the journal and directory entries all reach the disk before
 the response.
 

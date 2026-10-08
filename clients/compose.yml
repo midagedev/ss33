@@ -2,7 +2,7 @@
 # usage: SS33_IMAGE=ss33:local docker compose -f compose.yml up -d --wait minio && docker compose -f compose.yml run --rm createbuckets
 services:
   minio:
-    image: ${SS33_IMAGE:-ghcr.io/midagedev/ss33:0.3}
+    image: ${SS33_IMAGE:-ghcr.io/midagedev/ss33:0.4}
     command: server /data --console-address ":9001"
     ports:
       - "${SS33_PORT:-9000}:9000"
@@ -14,7 +14,7 @@ services:
       interval: 1s
 
   createbuckets:
-    image: ${SS33_IMAGE:-ghcr.io/midagedev/ss33:0.3}
+    image: ${SS33_IMAGE:-ghcr.io/midagedev/ss33:0.4}
     depends_on:
       minio:
         condition: service_healthy

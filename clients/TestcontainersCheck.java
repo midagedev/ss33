@@ -3,7 +3,7 @@
 //DEPS software.amazon.awssdk:s3:2.55.12
 //JAVA 17+
 // The README's Testcontainers snippet, run as written: MinIOContainer with the image substituted.
-// usage: jbang TestcontainersCheck.java ghcr.io/midagedev/ss33:0.3
+// usage: jbang TestcontainersCheck.java ghcr.io/midagedev/ss33:0.4
 import java.net.URI;
 import org.testcontainers.containers.MinIOContainer;
 import org.testcontainers.utility.DockerImageName;

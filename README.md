@@ -127,7 +127,7 @@ for ops/s and MiB/s; lower is better for ms. The [Benchmark workflow](.github/wo
 MinIO is built from source (the last published module version, 2026-02-12), since its images are gone. The
 others are their published images with default settings. MinIO and RustFS fsync before acknowledging a write;
 ss33, SeaweedFS and versitygw do not by default, so `ss33 --durable` is the column to compare with MinIO
-and RustFS. Shared runners are noisy: across three runs PUT 4 KiB ranged from 4,716 to
+and RustFS. Shared runners are noisy: across four runs PUT 4 KiB ranged from 4,577 to
 7,839 ops/s for ss33, but the ranking did not change.
 
 ### Feature checks

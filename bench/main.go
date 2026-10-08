@@ -83,11 +83,11 @@ func main() {
 	}))
 
 	big := random(256 << 20)
-	record(throughput("PUT 256 MiB", len(big), func() error {
+	record(throughput("PUT 256 MiB (best of 3)", len(big), func() error {
 		_, err := c.PutObject(ctx, &s3.PutObjectInput{Bucket: &b, Key: aws.String("big.bin"), Body: bytes.NewReader(big)})
 		return err
 	}))
-	record(throughput("GET 256 MiB", len(big), func() error {
+	record(throughput("GET 256 MiB (best of 3)", len(big), func() error {
 		r, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: &b, Key: aws.String("big.bin")})
 		if err != nil {
 			return err
@@ -103,7 +103,7 @@ func main() {
 		record("UploadPart 32 x 8 MiB", 0, "MiB/s", err)
 	} else {
 		parts := make([]types.CompletedPart, 32)
-		record(throughput("UploadPart 32 x 8 MiB, 32 concurrent", len(big), func() error {
+		record(throughput("UploadPart 32 x 8 MiB, 32 concurrent (best of 3)", len(big), func() error {
 			var wg sync.WaitGroup
 			errs := make([]error, 32)
 			for i := range 32 {
@@ -210,12 +210,17 @@ func ops(test string, n, conc int, fn func(i int) error) (string, float64, strin
 	return test, float64(n) / time.Since(start).Seconds(), "ops/s", nil
 }
 
+// throughput reports the best of three runs: single large transfers are noisy on shared runners.
 func throughput(test string, bytes int, fn func() error) (string, float64, string, error) {
-	start := time.Now()
-	if err := fn(); err != nil {
-		return test, 0, "MiB/s", err
+	best := 0.0
+	for range 3 {
+		start := time.Now()
+		if err := fn(); err != nil {
+			return test, 0, "MiB/s", err
+		}
+		best = max(best, float64(bytes)/(1<<20)/time.Since(start).Seconds())
 	}
-	return test, float64(bytes) / (1 << 20) / time.Since(start).Seconds(), "MiB/s", nil
+	return test, best, "MiB/s", nil
 }
 
 func latency(test string, fn func() error) (string, float64, string, error) {

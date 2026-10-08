@@ -22,9 +22,13 @@ check "ls --recursive" '[ "$("$mc" ls --recursive local/clients-mc | wc -l)" -eq
 check "cp download round-trips" '"$mc" cp local/clients-mc/big.bin "$work/back.bin" && cmp "$work/seed/big.bin" "$work/back.bin"'
 check "cp --recursive bucket to bucket" '"$mc" mb local/clients-mc-copy && "$mc" cp --recursive local/clients-mc/ local/clients-mc-copy/ &&
   [ "$("$mc" ls --recursive local/clients-mc-copy | wc -l)" -eq 2 ]'
+check "diff of identical buckets is empty" 'out=$("$mc" diff local/clients-mc local/clients-mc-copy) && [ -z "$out" ]'
+check "diff reports a missing object" '"$mc" rm local/clients-mc-copy/a/1.txt && "$mc" diff local/clients-mc local/clients-mc-copy | grep -q "a/1.txt"'
+check "mirror" '"$mc" mb local/clients-mc-mirror && "$mc" mirror local/clients-mc local/clients-mc-mirror &&
+  [ "$("$mc" ls --recursive local/clients-mc-mirror | wc -l)" -eq 2 ]'
 check "stat" '"$mc" stat local/clients-mc/a/1.txt'
 check "cat" '[ "$("$mc" cat local/clients-mc/a/1.txt)" = hello ]'
 check "rm" '"$mc" rm local/clients-mc/a/1.txt'
-check "rb --force" '"$mc" rb --force local/clients-mc && "$mc" rb --force local/clients-mc-copy'
-echo "official mc: $([ $fails = 0 ] && echo ALL PASS || echo "$fails FAILED")"
+check "rb --force" '"$mc" rb --force local/clients-mc && "$mc" rb --force local/clients-mc-copy && "$mc" rb --force local/clients-mc-mirror'
+echo "official mc ($mc): $([ $fails = 0 ] && echo ALL PASS || echo "$fails FAILED")"
 exit $((fails > 0))

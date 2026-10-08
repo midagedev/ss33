@@ -240,7 +240,7 @@ Every push runs these against the image built from that commit ([`clients/`](cli
 | AWS SDK for JavaScript v3 | `@aws-sdk/client-s3`, `lib-storage` `Upload`, `s3-request-presigner`, paginators, Range |
 | AWS SDK for Java 2.55 | `S3Client`, `S3AsyncClient` with `multipartEnabled`, `S3Presigner` for GET, PUT and UploadPart |
 | AWS CLI v2 | `s3 mb/cp/sync/ls/presign/rb --force`, `s3api` tagging and head-object |
-| Official `mc` | `alias set`, `ready`, `mb`, `anonymous set`, `cp --recursive`, `ls`, `stat`, `cat`, `rm`, `rb --force` |
+| Official `mc` (last release and RELEASE.2025-01-17) | `alias set`, `ready`, `mb`, `anonymous set`, `cp --recursive`, `ls`, `diff`, `mirror`, `stat`, `cat`, `rm`, `rb --force` |
 | Testcontainers | Java `MinIOContainer` and Python `MinioContainer` with the image substituted |
 | Docker Compose | The [drop-in example](#drop-in-replacement) above, run as written |
 

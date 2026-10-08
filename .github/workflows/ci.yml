@@ -131,12 +131,17 @@ jobs:
         if: ${{ !cancelled() }}
         run: bash clients/awscli.sh http://127.0.0.1:9000
 
-      # minio/mc has no pullable image any more; build its last upstream commit from the Go module proxy.
+      # minio/mc has no pullable image any more; build releases from the Go module proxy: the last one, and
+      # RELEASE.2025-01-17, which still lists with ?metadata=true for `mc diff`.
       - name: Official mc
         if: ${{ !cancelled() }}
+        shell: bash
         run: |
-          CGO_ENABLED=0 GOBIN=/tmp/mc-bin go install github.com/minio/mc@v0.0.0-20251106162529-77f82e18b540
-          bash clients/mc.sh http://127.0.0.1:9000 /tmp/mc-bin/mc
+          set -euo pipefail
+          for release in d6541ea280b73a834b64d4097e21f2be77676104 cc8758c88da31b95dde7b0b6997980ebfb8b98c4; do
+            CGO_ENABLED=0 GOBIN=/tmp/mc-$release go install github.com/minio/mc@$release
+            bash clients/mc.sh http://127.0.0.1:9000 /tmp/mc-$release/mc
+          done
 
       - name: Testcontainers for Java (MinIOContainer)
         if: ${{ !cancelled() }}

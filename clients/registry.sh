@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The Docker registry (distribution) with its S3 storage driver on ss33: push a multi-layer image, pull it
-# back, delete the manifest and garbage-collect.
+# back, delete the manifest and garbage-collect. Redirects are off: they would send the Docker client to
+# ss33's in-network host name, as they would in any compose stack.
 # usage: bash registry.sh <ss33 image> [registry port, default 5000]
 set -euo pipefail
 image=$1 port=${2:-5000} net=ss33-registry-check
@@ -15,6 +16,7 @@ docker run -d --name ss33-registry --network $net -p "$port:5000" \
   -e REGISTRY_STORAGE=s3 -e REGISTRY_STORAGE_S3_REGIONENDPOINT=http://ss33-registry-s3:9000 -e REGISTRY_STORAGE_S3_REGION=us-east-1 \
   -e REGISTRY_STORAGE_S3_BUCKET=registry -e REGISTRY_STORAGE_S3_ACCESSKEY=minioadmin -e REGISTRY_STORAGE_S3_SECRETKEY=minioadmin \
   -e REGISTRY_STORAGE_S3_FORCEPATHSTYLE=true -e REGISTRY_STORAGE_S3_SECURE=false -e REGISTRY_STORAGE_DELETE_ENABLED=true \
+  -e REGISTRY_STORAGE_REDIRECT_DISABLE=true \
   registry:3 >/dev/null
 until curl -fsS "http://127.0.0.1:$port/v2/" >/dev/null 2>&1; do sleep 0.2; done
 

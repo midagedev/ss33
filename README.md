@@ -49,8 +49,9 @@ Change the two `image:` lines. Leave `command`, `environment` and `healthcheck` 
 These carry over unchanged:
 
 - **Command:** `server <dir> [--address :9000] [--console-address ...]`.
-- **Credentials:** `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`. The legacy `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` also work.
-- **Health:** `/minio/health/live`, `/minio/health/ready` and `/healthz`. `curl` is in the image.
+- **Credentials:** `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`, or the legacy `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`.
+  With none set, MinIO's defaults `minioadmin` / `minioadmin` apply.
+- **Health:** `/minio/health/live`, `/minio/health/ready`, `/minio/health/cluster` and `/healthz`. `curl` is in the image.
 - **mc:** `mc` is at `/usr/bin/mc` and `/usr/local/bin/mc`, and `/bin/sh` is available for `entrypoint: /bin/sh -c "..."` scripts.
 
 There are three things to watch for:
@@ -64,11 +65,11 @@ There are three things to watch for:
 ## Quick start
 
 ```sh
-docker run -d -p 9000:9000 ghcr.io/midagedev/ss33:0.2    # credentials: ss33 / ss33secret
+docker run -d -p 9000:9000 ghcr.io/midagedev/ss33:0.2    # credentials: minioadmin / minioadmin, as MinIO
 ```
 
 ```sh
-export AWS_ACCESS_KEY_ID=ss33 AWS_SECRET_ACCESS_KEY=ss33secret AWS_DEFAULT_REGION=us-east-1
+export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_DEFAULT_REGION=us-east-1
 aws --endpoint-url http://localhost:9000 s3 mb s3://demo
 aws --endpoint-url http://localhost:9000 s3 cp ./README.md s3://demo/
 aws --endpoint-url http://localhost:9000 s3 ls s3://demo/
@@ -79,7 +80,7 @@ Without Docker:
 ```sh
 go install github.com/midagedev/ss33/cmd/ss33@latest
 ss33 server ./data                 # S3 API on :9000
-ss33 mc alias set local http://localhost:9000 ss33 ss33secret
+ss33 mc alias set local http://localhost:9000 minioadmin minioadmin
 ```
 
 Point SDKs at the endpoint with path-style addressing, for example `forcePathStyle: true` (JS),
@@ -218,7 +219,7 @@ the response.
 | Buckets | Create, Delete, Head, List, Location, ListObjects v1/v2, ListObjectVersions, bucket policy (public-read), ACL (read) | Notifications, replication, website |
 | Bucket configuration | Versioning, CORS, lifecycle, encryption and tags are stored and returned, not enforced | Keeping old versions, expiring objects |
 | Multipart | Create, UploadPart, UploadPartCopy, Complete, Abort, ListParts, ListMultipartUploads | |
-| Auth | SigV4 header and presigned URLs (expiry enforced), SigV2 presigned URLs (boto3's default), browser POST policy uploads, `aws-chunked` streaming, anonymous GET on public buckets and objects | SigV2 headers, multiple users, STS |
+| Auth | SigV4 header and presigned URLs (expiry and clock skew enforced), SigV2 presigned URLs (boto3's default), browser POST policy uploads, `aws-chunked` streaming, anonymous requests the bucket policy allows (Deny wins), anonymous GET on `public-read` objects | SigV2 headers, multiple users, STS |
 | Checksums | `x-amz-checksum-{crc32,crc32c,crc64nvme,sha1,sha256}` returned on PutObject | |
 | Addressing | Path-style | Virtual-hosted |
 | Browser | CORS allows every origin and exposes `ETag` | |
@@ -227,23 +228,35 @@ the response.
 Unsupported operations return `501 NotImplemented` as an S3 XML error. They never fail silently.
 The full list is in [docs/compatibility.md](docs/compatibility.md).
 
-## Verified clients
+## Tested clients
 
-- **In CI on every change:** aws-sdk-go-v2 (`service/s3` v1.114.1), which the test suite in
-  [`internal/server`](internal/server) drives operation by operation. The suite also replays an `mc` bootstrap
-  script.
-- **Checked by hand:**
-  - AWS SDK for Java 2.31.1: `S3Client`, `S3AsyncClient` with `multipartEnabled`, and `S3Presigner` for GET, PUT and UploadPart.
-  - AWS SDK for JavaScript v3: `@aws-sdk/client-s3` 3.1143.0.
-  - boto3 1.43: `upload_fileobj`/`download_fileobj`, managed `copy`, paginators, `generate_presigned_url`,
-    `generate_presigned_post`, tagging, ACLs, conditional PUT, versions and uploads listings.
-  - AWS CLI 2.37.4: `mb`, `cp` (including multipart), `ls`, `sync`, `presign`, `s3api` tagging and `rb --force`.
+Every push runs these against the image built from that commit ([`clients/`](clients),
+[CI workflow](.github/workflows/ci.yml)):
+
+| Client | What runs |
+|---|---|
+| aws-sdk-go-v2 | The test suite in [`internal/`](internal), operation by operation, plus an `mc` bootstrap script |
+| boto3 1.43 | `upload_fileobj`/`download_fileobj`, managed `copy`, paginators, `generate_presigned_url` (SigV2 and SigV4), `generate_presigned_post`, tagging, ACLs, conditional PUT |
+| AWS SDK for JavaScript v3 | `@aws-sdk/client-s3`, `lib-storage` `Upload`, `s3-request-presigner`, paginators, Range |
+| AWS SDK for Java 2.55 | `S3Client`, `S3AsyncClient` with `multipartEnabled`, `S3Presigner` for GET, PUT and UploadPart |
+| AWS CLI v2 | `s3 mb/cp/sync/ls/presign/rb --force`, `s3api` tagging and head-object |
+| Official `mc` | `alias set`, `ready`, `mb`, `anonymous set`, `cp --recursive`, `ls`, `stat`, `cat`, `rm`, `rb --force` |
+| Testcontainers | Java `MinIOContainer` and Python `MinioContainer` with the image substituted |
+| Docker Compose | The [drop-in example](#drop-in-replacement) above, run as written |
 
 ## Non-goals
 
 ss33 is a test double, not a storage system. It has no production durability guarantees, no web console, no
 version history or replication, no clustering, and only one set of credentials. For those, use real S3 or a full
 S3-compatible server.
+
+## Developing
+
+```sh
+go test -race ./...                          # the server, store, signing and mc packages
+docker build -t ss33:local .
+bash clients/awscli.sh http://127.0.0.1:9000 # each script in clients/ takes an endpoint
+```
 
 ## License
 

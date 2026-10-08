@@ -3,10 +3,14 @@ package server
 
 import (
 	"crypto/rand"
+	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
+	"hash"
+	"hash/crc32"
 	"io"
 	"log/slog"
 	"net/http"
@@ -433,13 +437,50 @@ func requestBody(r *http.Request) io.Reader {
 	return r.Body
 }
 
+// checksumHashes are the x-amz-checksum-* algorithms PutObject answers for. The value is computed over the
+// stored bytes, not copied from the request; a client-sent value is not compared against it.
+// ponytail: no CRC64NVME (no SDK we serve defaults to it); add a crc64 table with poly 0x9a6c9329ac4bc9b5 if one does.
+var checksumHashes = map[string]func() hash.Hash{
+	"crc32":  func() hash.Hash { return crc32.NewIEEE() },
+	"crc32c": func() hash.Hash { return crc32.New(crc32.MakeTable(crc32.Castagnoli)) },
+	"sha1":   sha1.New,
+	"sha256": sha256.New,
+}
+
+// requestedChecksum names the algorithm a request asked for: the SDK header, an aws-chunked trailer, or a
+// checksum header sent up front.
+func requestedChecksum(r *http.Request) string {
+	if alg := r.Header.Get("X-Amz-Sdk-Checksum-Algorithm"); alg != "" {
+		return strings.ToLower(alg)
+	}
+	if t := r.Header.Get("X-Amz-Trailer"); t != "" {
+		return strings.TrimPrefix(strings.ToLower(t), "x-amz-checksum-")
+	}
+	for alg := range checksumHashes {
+		if r.Header.Get("X-Amz-Checksum-"+alg) != "" {
+			return alg
+		}
+	}
+	return ""
+}
+
 func (s *Server) putObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
-	meta, err := s.Store.PutObject(bucket, objectMetaFromRequest(r, key), requestBody(r))
+	body := requestBody(r)
+	alg := requestedChecksum(r)
+	var sum hash.Hash
+	if newHash, ok := checksumHashes[alg]; ok {
+		sum = newHash()
+		body = io.TeeReader(body, sum)
+	}
+	meta, err := s.Store.PutObject(bucket, objectMetaFromRequest(r, key), body)
 	if err != nil {
 		s.storeErr(w, r, err)
 		return
 	}
 	w.Header().Set("ETag", meta.ETag)
+	if sum != nil {
+		w.Header().Set("X-Amz-Checksum-"+alg, base64.StdEncoding.EncodeToString(sum.Sum(nil)))
+	}
 	w.WriteHeader(http.StatusOK)
 }
 

@@ -12,6 +12,7 @@ Anything else answers `501 NotImplemented` with an S3 XML error.
 | Objects | PutObject, GetObject (Range, If-None-Match, `response-*` overrides), HeadObject, DeleteObject, CopyObject (COPY/REPLACE metadata directive) |
 | Multipart | CreateMultipartUpload, UploadPart, CompleteMultipartUpload (S3-style `-N` ETag), AbortMultipartUpload, ListParts |
 | Bodies | Plain and `aws-chunked` (signed or unsigned, with trailers); chunk signatures and checksums are not verified |
+| Checksums | PutObject answers `x-amz-checksum-{crc32,crc32c,sha1,sha256}` computed over the stored bytes when the request names that algorithm (header, trailer, or `x-amz-sdk-checksum-algorithm`); client-sent values are not compared, CRC64NVME is not computed |
 | Metadata | Content-Type, Content-Disposition, Cache-Control, Content-Language, Content-Encoding, Expires, `x-amz-meta-*` |
 | CORS | Every origin is allowed; preflights echo the requested headers |
 | Health | `/minio/health/live`, `/minio/health/ready`, `/healthz` |

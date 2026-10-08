@@ -7,8 +7,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -130,12 +134,17 @@ func TestStreamingUpload(t *testing.T) {
 		Credentials: credentials.NewStaticCredentialsProvider(testAK, testSK, "")})
 	mustBucket(t, c, "bkt")
 	payload := bytes.Repeat([]byte("0123456789"), 20000)
-	_, err = c.PutObject(ctx, &s3.PutObjectInput{
+	put, err := c.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String("bkt"), Key: aws.String("stream.bin"),
 		Body: io.NopCloser(bytes.NewReader(payload)), ContentLength: aws.Int64(int64(len(payload))),
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32, // sent as an aws-chunked trailer
 	})
 	if err != nil {
 		t.Fatalf("streaming PutObject: %v", err)
+	}
+	// The trailing checksum's algorithm is answered with the CRC32 of the stored bytes.
+	if want := base64.StdEncoding.EncodeToString(binary.BigEndian.AppendUint32(nil, crc32.ChecksumIEEE(payload))); aws.ToString(put.ChecksumCRC32) != want {
+		t.Fatalf("ChecksumCRC32 = %q, want %q", aws.ToString(put.ChecksumCRC32), want)
 	}
 	got, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("bkt"), Key: aws.String("stream.bin")})
 	if err != nil {
@@ -145,6 +154,25 @@ func TestStreamingUpload(t *testing.T) {
 	got.Body.Close()
 	if !bytes.Equal(data, payload) {
 		t.Fatalf("streamed object corrupted: len %d want %d", len(data), len(payload))
+	}
+}
+
+// Callers that ask for a checksum on PutObject read it back from the response to record what was stored.
+func TestPutObjectChecksum(t *testing.T) {
+	ctx := context.Background()
+	_, c := newServer(t)
+	mustBucket(t, c, "bkt")
+	payload := []byte("checksum me")
+	out, err := c.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String("bkt"), Key: aws.String("sum.bin"), Body: bytes.NewReader(payload),
+		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	if want := base64.StdEncoding.EncodeToString(sum[:]); aws.ToString(out.ChecksumSHA256) != want {
+		t.Fatalf("ChecksumSHA256 = %q, want %q", aws.ToString(out.ChecksumSHA256), want)
 	}
 }
 

@@ -24,7 +24,7 @@ Change the two `image:` lines. Leave `command`, `environment` and `healthcheck` 
  services:
    minio:
 -    image: minio/minio
-+    image: ghcr.io/midagedev/ss33:0.2
++    image: ghcr.io/midagedev/ss33:0.3
      command: server /data --console-address ":9001"
      environment:
        MINIO_ROOT_USER: minioadmin
@@ -34,7 +34,7 @@ Change the two `image:` lines. Leave `command`, `environment` and `healthcheck` 
 
    createbuckets:
 -    image: minio/mc
-+    image: ghcr.io/midagedev/ss33:0.2
++    image: ghcr.io/midagedev/ss33:0.3
      depends_on:
        minio:
          condition: service_healthy
@@ -65,7 +65,7 @@ There are three things to watch for:
 ## Quick start
 
 ```sh
-docker run -d -p 9000:9000 ghcr.io/midagedev/ss33:0.2    # credentials: minioadmin / minioadmin, as MinIO
+docker run -d -p 9000:9000 ghcr.io/midagedev/ss33:0.3    # credentials: minioadmin / minioadmin, as MinIO
 ```
 
 ```sh
@@ -91,7 +91,7 @@ Point SDKs at the endpoint with path-style addressing, for example `forcePathSty
 accepts. In Java, declare the substitution:
 
 ```java
-new MinIOContainer(DockerImageName.parse("ghcr.io/midagedev/ss33:0.2").asCompatibleSubstituteFor("minio/minio"))
+new MinIOContainer(DockerImageName.parse("ghcr.io/midagedev/ss33:0.3").asCompatibleSubstituteFor("minio/minio"))
 ```
 
 In Go, Python and Node, pass the image name where the module takes one.

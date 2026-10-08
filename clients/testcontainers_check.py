@@ -1,6 +1,6 @@
 """testcontainers-python's MinioContainer with the image substituted, as the README suggests.
 
-usage: python testcontainers_check.py ghcr.io/midagedev/ss33:0.2
+usage: python testcontainers_check.py ghcr.io/midagedev/ss33:0.3
 """
 import io
 import sys

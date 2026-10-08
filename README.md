@@ -255,7 +255,7 @@ S3-compatible server.
 ```sh
 go test -race ./...                          # the server, store, signing and mc packages
 docker build -t ss33:local .
-bash clients/awscli.sh http://127.0.0.1:9000 # each script in clients/ takes an endpoint
+bash clients/awscli.sh http://127.0.0.1:9000 # the other clients/ scripts say how to run them in their header
 ```
 
 ## License

@@ -260,9 +260,9 @@ Every push runs these against the image built from that commit ([`clients/`](cli
 | Testcontainers | Java `MinIOContainer` and Python `MinioContainer` with the image substituted |
 | Docker Compose | The [drop-in example](#drop-in-replacement) above, run as written |
 
-Checked by hand: rclone, restic, s3cmd, s5cmd, DuckDB, pandas with s3fs, pyarrow, Polars, Grafana Loki,
-Thanos, MLflow, PyIceberg, the PHP (and Flysystem), Ruby, .NET and Rust AWS SDKs, and the MinIO Go,
-JavaScript and Python SDKs.
+Checked by hand on 0.4: rclone, restic, s3cmd, s5cmd, DuckDB, pandas with s3fs, pyarrow, Polars, the Ruby and
+PHP (with Flysystem) AWS SDKs, and the MinIO JavaScript and Python SDKs. On 0.3, before this release's
+checksum verification: Grafana Loki, Thanos, MLflow, PyIceberg, and the .NET and Rust AWS SDKs.
 
 ## Non-goals
 

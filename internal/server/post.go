@@ -101,6 +101,15 @@ func (s *Server) storePostedFile(w http.ResponseWriter, r *http.Request, bucket 
 		}
 	}
 	meta.Public = publicACL(fields["acl"])
+	// Encryption from the form (x-amz-server-side-encryption and its key ID), or the bucket's default.
+	if alg := fields[strings.ToLower(hdrSSE)]; alg == "AES256" || alg == "aws:kms" || alg == "aws:kms:dsse" {
+		meta.Headers[hdrSSE] = alg
+		if id := fields[strings.ToLower(hdrSSEKMSKey)]; id != "" {
+			meta.Headers[hdrSSEKMSKey] = id
+		}
+	} else {
+		s.defaultEncryption(bucket, meta.Headers)
+	}
 	out, err := s.Store.PutObject(bucket, meta, &sizeLimit{r: file, min: min, max: max}, store.Precondition{})
 	switch {
 	case errors.Is(err, errTooLarge):
@@ -117,6 +126,7 @@ func (s *Server) storePostedFile(w http.ResponseWriter, r *http.Request, bucket 
 	s.notify(r, bucket, "s3:ObjectCreated:Post", out)
 	location := "/" + bucket + "/" + out.Key
 	w.Header().Set("ETag", out.ETag)
+	setEncryptionHeaders(w, out)
 	w.Header().Set("Location", location)
 	switch fields["success_action_status"] {
 	case "200":

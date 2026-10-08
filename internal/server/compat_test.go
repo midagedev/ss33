@@ -465,6 +465,15 @@ func TestPresignedPost(t *testing.T) {
 		t.Fatalf("posted object: %q type=%q meta=%v", data, aws.ToString(got.ContentType), got.Metadata)
 	}
 
+	// A form upload gets the bucket's default encryption, like any other write.
+	if _, err := c.PutBucketEncryption(ctx, &s3.PutBucketEncryptionInput{Bucket: aws.String("bkt"), ServerSideEncryptionConfiguration: &types.ServerSideEncryptionConfiguration{
+		Rules: []types.ServerSideEncryptionRule{{ApplyServerSideEncryptionByDefault: &types.ServerSideEncryptionByDefault{SSEAlgorithm: types.ServerSideEncryptionAes256}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := post("encrypted", limit, map[string]string{"Content-Type": "text/plain"}, "x"); resp.Header.Get("X-Amz-Server-Side-Encryption") != "AES256" {
+		t.Fatalf("POST under a bucket default: %v", resp.Header)
+	}
+
 	if resp, body := post("big", limit, map[string]string{"Content-Type": "text/plain"}, "more than ten bytes"); resp.StatusCode != http.StatusBadRequest || !strings.Contains(body, "EntityTooLarge") {
 		t.Fatalf("oversized POST: %s %s", resp.Status, body)
 	}
@@ -690,5 +699,73 @@ func TestCreateBucketWithTags(t *testing.T) {
 	out, err := c.GetBucketTagging(ctx, &s3.GetBucketTaggingInput{Bucket: aws.String("bkt")})
 	if err != nil || len(out.TagSet) != 1 || aws.ToString(out.TagSet[0].Value) != "platform" {
 		t.Fatalf("GetBucketTagging: %+v %v", out, err)
+	}
+}
+
+// The bucket configurations Terraform's aws_s3_bucket reads and its companion resources write: stored and
+// returned, with S3's "not found" or default answers before they are set.
+func TestTerraformBucketConfigurations(t *testing.T) {
+	ctx := context.Background()
+	_, c := newServer(t)
+	mustBucket(t, c, "bkt")
+	b := aws.String("bkt")
+
+	if _, err := c.GetPublicAccessBlock(ctx, &s3.GetPublicAccessBlockInput{Bucket: b}); errCode(err) != "NoSuchPublicAccessBlockConfiguration" {
+		t.Fatalf("GetPublicAccessBlock before Put: %v", err)
+	}
+	if _, err := c.PutPublicAccessBlock(ctx, &s3.PutPublicAccessBlockInput{Bucket: b, PublicAccessBlockConfiguration: &types.PublicAccessBlockConfiguration{
+		BlockPublicAcls: aws.Bool(true)}}); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := c.GetPublicAccessBlock(ctx, &s3.GetPublicAccessBlockInput{Bucket: b}); err != nil || !aws.ToBool(out.PublicAccessBlockConfiguration.BlockPublicAcls) {
+		t.Fatalf("GetPublicAccessBlock: %+v %v", out, err)
+	}
+	if _, err := c.DeletePublicAccessBlock(ctx, &s3.DeletePublicAccessBlockInput{Bucket: b}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := c.PutBucketOwnershipControls(ctx, &s3.PutBucketOwnershipControlsInput{Bucket: b, OwnershipControls: &types.OwnershipControls{
+		Rules: []types.OwnershipControlsRule{{ObjectOwnership: types.ObjectOwnershipBucketOwnerPreferred}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := c.GetBucketOwnershipControls(ctx, &s3.GetBucketOwnershipControlsInput{Bucket: b}); err != nil || out.OwnershipControls.Rules[0].ObjectOwnership != types.ObjectOwnershipBucketOwnerPreferred {
+		t.Fatalf("GetBucketOwnershipControls: %+v %v", out, err)
+	}
+
+	if _, err := c.GetBucketWebsite(ctx, &s3.GetBucketWebsiteInput{Bucket: b}); errCode(err) != "NoSuchWebsiteConfiguration" {
+		t.Fatalf("GetBucketWebsite before Put: %v", err)
+	}
+	if _, err := c.PutBucketWebsite(ctx, &s3.PutBucketWebsiteInput{Bucket: b, WebsiteConfiguration: &types.WebsiteConfiguration{
+		IndexDocument: &types.IndexDocument{Suffix: aws.String("index.html")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := c.GetBucketWebsite(ctx, &s3.GetBucketWebsiteInput{Bucket: b}); err != nil || aws.ToString(out.IndexDocument.Suffix) != "index.html" {
+		t.Fatalf("GetBucketWebsite: %+v %v", out, err)
+	}
+	if _, err := c.GetBucketReplication(ctx, &s3.GetBucketReplicationInput{Bucket: b}); errCode(err) != "ReplicationConfigurationNotFoundError" {
+		t.Fatalf("GetBucketReplication: %v", err)
+	}
+
+	// Read before they are set: S3's defaults.
+	if out, err := c.GetBucketRequestPayment(ctx, &s3.GetBucketRequestPaymentInput{Bucket: b}); err != nil || out.Payer != types.PayerBucketOwner {
+		t.Fatalf("GetBucketRequestPayment: %+v %v", out, err)
+	}
+	if out, err := c.GetBucketLogging(ctx, &s3.GetBucketLoggingInput{Bucket: b}); err != nil || out.LoggingEnabled != nil {
+		t.Fatalf("GetBucketLogging: %+v %v", out, err)
+	}
+	if out, err := c.GetBucketAccelerateConfiguration(ctx, &s3.GetBucketAccelerateConfigurationInput{Bucket: b}); err != nil || out.Status != "" {
+		t.Fatalf("GetBucketAccelerateConfiguration: %+v %v", out, err)
+	}
+
+	// The Terraform provider waits until the lifecycle's transition size reads back as it sent it.
+	if _, err := c.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{Bucket: b,
+		TransitionDefaultMinimumObjectSize: types.TransitionDefaultMinimumObjectSizeVariesByStorageClass,
+		LifecycleConfiguration: &types.BucketLifecycleConfiguration{Rules: []types.LifecycleRule{{ID: aws.String("r"), Status: types.ExpirationStatusEnabled,
+			Filter: &types.LifecycleRuleFilter{Prefix: aws.String("tmp/")}, Expiration: &types.LifecycleExpiration{Days: aws.Int32(7)}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	lc, err := c.GetBucketLifecycleConfiguration(ctx, &s3.GetBucketLifecycleConfigurationInput{Bucket: b})
+	if err != nil || lc.TransitionDefaultMinimumObjectSize != types.TransitionDefaultMinimumObjectSizeVariesByStorageClass || len(lc.Rules) != 1 {
+		t.Fatalf("GetBucketLifecycleConfiguration: %+v %v", lc, err)
 	}
 }

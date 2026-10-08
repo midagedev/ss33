@@ -74,6 +74,13 @@ func (s *Server) requestMeta(r *http.Request, bucket, key string) (store.ObjectM
 		}
 		return meta, nil
 	}
+	s.defaultEncryption(bucket, meta.Headers)
+	return meta, nil
+}
+
+// defaultEncryption records the bucket's default encryption in headers, for an object written without its
+// own.
+func (s *Server) defaultEncryption(bucket string, headers map[string]string) {
 	if b, err := s.Store.Bucket(bucket); err == nil && b.Configs["encryption"] != "" {
 		var cfg struct {
 			Rules []struct {
@@ -86,16 +93,15 @@ func (s *Server) requestMeta(r *http.Request, bucket, key string) (store.ObjectM
 		}
 		if xml.Unmarshal([]byte(b.Configs["encryption"]), &cfg) == nil && len(cfg.Rules) > 0 && cfg.Rules[0].Default.SSEAlgorithm != "" {
 			rule := cfg.Rules[0]
-			meta.Headers[hdrSSE] = rule.Default.SSEAlgorithm
+			headers[hdrSSE] = rule.Default.SSEAlgorithm
 			if rule.Default.KMSMasterKeyID != "" {
-				meta.Headers[hdrSSEKMSKey] = rule.Default.KMSMasterKeyID
+				headers[hdrSSEKMSKey] = rule.Default.KMSMasterKeyID
 			}
 			if rule.BucketKeyEnabled {
-				meta.Headers[hdrSSEBucketKey] = "true"
+				headers[hdrSSEBucketKey] = "true"
 			}
 		}
 	}
-	return meta, nil
 }
 
 // copySourcePrefix turns an SSE-C header name into its copy-source form:

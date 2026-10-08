@@ -744,3 +744,9 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.status = code
 	s.ResponseWriter.WriteHeader(code)
 }
+
+// ReadFrom keeps net/http's sendfile path: without it, embedding hides http.response's ReadFrom and every
+// GET body is copied through a 32 KiB user-space buffer.
+func (s *statusRecorder) ReadFrom(r io.Reader) (int64, error) {
+	return io.Copy(s.ResponseWriter, r)
+}

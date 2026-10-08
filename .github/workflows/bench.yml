@@ -29,6 +29,10 @@ jobs:
           docker build -t ss33:bench .
           cd bench && go build -o /tmp/s3bench .
 
+      # MinIO has no pullable image any more; build its last upstream commit from the Go module proxy.
+      - name: Build MinIO from source
+        run: CGO_ENABLED=0 GOBIN=/tmp/minio-bin go install github.com/minio/minio@v0.0.0-20260212201848-7aac2a2c5b7c
+
       - name: Run
         shell: bash
         run: |
@@ -50,6 +54,7 @@ jobs:
           creds=(-e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin)
           bench "ss33" 9000 "${creds[@]}" -e SS33_QUIET=1 ss33:bench server /data
           bench "ss33 --durable" 9000 "${creds[@]}" -e SS33_QUIET=1 -e SS33_DURABLE=1 ss33:bench server /data
+          bench "MinIO (source, 2026-02-12)" 9000 "${creds[@]}" -v /tmp/minio-bin/minio:/usr/bin/minio:ro alpine:3.22 minio server /data
           bench "RustFS 1.0.1" 9000 "${creds[@]}" rustfs/rustfs:1.0.1 server /data
           bench "SeaweedFS 4.48" 8333 -e AWS_ACCESS_KEY_ID=minioadmin -e AWS_SECRET_ACCESS_KEY=minioadmin chrislusf/seaweedfs:4.48 mini -dir=/data
           bench "versitygw 1.8.0" 9000 -e ROOT_ACCESS_KEY=minioadmin -e ROOT_SECRET_KEY=minioadmin \

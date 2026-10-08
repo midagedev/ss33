@@ -1,0 +1,29 @@
+# The README's drop-in example, run as written; only the image is a variable so CI can test its own build.
+# usage: SS33_IMAGE=ss33:local docker compose -f compose.yml up -d --wait minio && docker compose -f compose.yml run --rm createbuckets
+services:
+  minio:
+    image: ${SS33_IMAGE:-ghcr.io/midagedev/ss33:0.2}
+    command: server /data --console-address ":9001"
+    ports:
+      - "${SS33_PORT:-9000}:9000"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 1s
+
+  createbuckets:
+    image: ${SS33_IMAGE:-ghcr.io/midagedev/ss33:0.2}
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      set -e;
+      /usr/bin/mc alias set local http://minio:9000 minioadmin minioadmin;
+      /usr/bin/mc mb --ignore-existing local/uploads;
+      /usr/bin/mc anonymous set download local/uploads;
+      echo hello > /tmp/hello.txt;
+      /usr/bin/mc cp /tmp/hello.txt local/uploads/hello.txt;
+      "

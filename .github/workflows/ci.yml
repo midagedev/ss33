@@ -66,3 +66,97 @@ jobs:
             echo hello > /tmp/hello.txt
             mc cp /tmp/hello.txt local/smoke/hello.txt
             mc ls local/smoke | grep -q hello.txt'
+
+  # Real clients against the image built from this commit. Each step runs even if an earlier one failed, so
+  # one run shows every client's result.
+  clients:
+    name: Clients
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Build image and start it with no credentials set
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -t ss33:local .
+          docker run -d --name ss33 -p 9000:9000 -e SS33_QUIET=1 ss33:local
+          for _ in {1..30}; do curl -fsS http://127.0.0.1:9000/minio/health/live && break; sleep 1; done
+          curl -Ls https://sh.jbang.dev | bash -s - app setup >/dev/null
+          echo "$HOME/.jbang/bin" >> "$GITHUB_PATH"
+
+      - name: boto3
+        if: ${{ !cancelled() }}
+        run: |
+          pip install --quiet boto3==1.43.109
+          python clients/boto3_check.py http://127.0.0.1:9000
+
+      - name: AWS SDK for JavaScript v3
+        if: ${{ !cancelled() }}
+        working-directory: clients/js
+        run: |
+          npm ci --no-audit --no-fund
+          node check.mjs http://127.0.0.1:9000
+
+      - name: AWS SDK for Java v2
+        if: ${{ !cancelled() }}
+        run: jbang clients/JavaCheck.java http://127.0.0.1:9000
+
+      - name: AWS CLI v2
+        if: ${{ !cancelled() }}
+        run: bash clients/awscli.sh http://127.0.0.1:9000
+
+      # minio/mc has no pullable image any more; build its last upstream commit from the Go module proxy.
+      - name: Official mc
+        if: ${{ !cancelled() }}
+        run: |
+          CGO_ENABLED=0 GOBIN=/tmp/mc-bin go install github.com/minio/mc@v0.0.0-20251106162529-77f82e18b540
+          bash clients/mc.sh http://127.0.0.1:9000 /tmp/mc-bin/mc
+
+      - name: Testcontainers for Java (MinIOContainer)
+        if: ${{ !cancelled() }}
+        run: jbang clients/TestcontainersCheck.java ss33:local
+
+      - name: Testcontainers for Python (MinioContainer)
+        if: ${{ !cancelled() }}
+        run: |
+          pip install --quiet "testcontainers[minio]==4.15.0"
+          python clients/testcontainers_check.py ss33:local
+
+      - name: README compose example
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          SS33_IMAGE: ss33:local
+          SS33_PORT: "9100"
+        run: |
+          set -euo pipefail
+          docker compose -f clients/compose.yml up -d --wait minio
+          docker compose -f clients/compose.yml run --rm createbuckets
+          test "$(curl -fsS http://127.0.0.1:9100/uploads/hello.txt)" = hello
+          docker compose -f clients/compose.yml down -v

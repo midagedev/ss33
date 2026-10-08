@@ -279,6 +279,38 @@ func compatChecks(c *s3.Client, ep, ak, sk, b string) []struct {
 			}
 			return nil
 		}},
+		{"GetObject partNumber (multipart downloaders)", func() error {
+			out, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: &b, Key: str("presign.txt"), PartNumber: aws.Int32(1)})
+			if err != nil {
+				return err
+			}
+			body, _ := io.ReadAll(out.Body)
+			out.Body.Close()
+			if string(body) != "hi" {
+				return fmt.Errorf("part 1 of a single-part object reads %q", body)
+			}
+			return nil
+		}},
+		{"Content-MD5 mismatch rejected (BadDigest)", func() error {
+			wrong := "1B2M2Y8AsgTpgAmY7PhCfg==" // the MD5 of an empty body
+			err := putText("corrupt.txt", "not empty", func(in *s3.PutObjectInput) { in.ContentMD5 = &wrong })
+			var apiErr smithy.APIError
+			if !errors.As(err, &apiErr) || apiErr.ErrorCode() != "BadDigest" {
+				return fmt.Errorf("want BadDigest, got %v", err)
+			}
+			return nil
+		}},
+		{"SSE-S3 header returned on PUT and HEAD", func() error {
+			out, err := c.PutObject(ctx, &s3.PutObjectInput{Bucket: &b, Key: str("sse.txt"), Body: strings.NewReader("x"), ServerSideEncryption: types.ServerSideEncryptionAes256})
+			if err != nil {
+				return err
+			}
+			head, err := c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &b, Key: str("sse.txt")})
+			if err == nil && (out.ServerSideEncryption != types.ServerSideEncryptionAes256 || head.ServerSideEncryption != types.ServerSideEncryptionAes256) {
+				err = fmt.Errorf("PUT answered %q, HEAD %q", out.ServerSideEncryption, head.ServerSideEncryption)
+			}
+			return err
+		}},
 		{"Put/GetBucketCors", func() error {
 			if _, err := c.PutBucketCors(ctx, &s3.PutBucketCorsInput{Bucket: &b, CORSConfiguration: &types.CORSConfiguration{
 				CORSRules: []types.CORSRule{{AllowedOrigins: []string{"*"}, AllowedMethods: []string{"GET", "PUT"}}}}}); err != nil {

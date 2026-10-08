@@ -8,6 +8,9 @@
 **A drop-in replacement for the `minio/minio` and `minio/mc` images in local dev and CI.**
 It is a small S3-compatible server and an `mc`-compatible CLI in one 10 MB image.
 
+10 MB image, healthy in about 170 ms, 2 MiB of memory at idle. On the same CI runner it handles 2–4× the
+small-object requests per second that MinIO does ([numbers](#numbers)).
+
 ## Why
 
 As of October 2026, `docker pull minio/minio` and `docker pull minio/mc` fail: both images are gone from Docker
@@ -123,7 +126,8 @@ for ops/s and MiB/s; lower is better for ms. The [Benchmark workflow](.github/wo
 
 MinIO is built from source (the last published module version, 2026-02-12), since its images are gone. The
 others are their published images with default settings. Only ss33 skips fsync by default; `ss33 --durable`
-is the like-for-like column. Shared runners are noisy, and single runs vary by 20–30 %.
+is the like-for-like column. Shared runners are noisy: across three runs PUT 4 KiB ranged from 4,716 to
+7,839 ops/s for ss33, but the ranking did not change.
 
 ### Feature checks
 
@@ -136,7 +140,7 @@ commonly lean on beyond plain PUT/GET, each driven through aws-sdk-go-v2.
 | SigV2 presigned GET (boto3's default) | ✓ | ✓ | ✓ | ✓ | ✗ |
 | Presigned POST (browser form upload) | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Bucket policy: anonymous read | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Object ACL `public-read`: anonymous read | ✓ | ✗ | ✗ | ✗ | ✗ |
+| Object ACL `public-read`: anonymous read² | ✓ | ✗ | ✗ | ✗ | ✗ |
 | GetObjectAcl | ✓ | ✓ | ✓ | ✓ | ✗ |
 | Object tagging | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Conditional PUT (`If-None-Match: *`) | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -155,14 +159,17 @@ commonly lean on beyond plain PUT/GET, each driven through aws-sdk-go-v2.
 expires, nothing is encrypted, and CORS stays open to every origin. The checks test that a call succeeds and
 round-trips, not what a full server does with it.
 
+² Real S3 disables ACLs on new buckets by default since 2023, and MinIO accepts the header but ignores it.
+ss33 follows the older behaviour so that code written for it still works in tests.
+
 ### Footprint
 
-| | ss33 0.1 | minio/minio `RELEASE.2025-01-20T14-49-07Z` |
+| | ss33 0.2 | minio/minio `RELEASE.2025-01-20T14-49-07Z` |
 |---|---:|---:|
-| Image, compressed | **9.6 MB** | 58.6 MB |
-| Image, on disk | **32.5 MB** | 235 MB |
-| Cold start → `/minio/health/live` 200 (median of 5) | **168 ms** | 429 ms |
-| Idle memory | **2.1 MiB** | 85.5 MiB |
+| Image, compressed | **9.7 MB** | 58.6 MB |
+| Image, on disk | **32.7 MB** | 235 MB |
+| Cold start → `/minio/health/live` 200 (median of 5) | **165 ms** | 429 ms |
+| Idle memory | **1.9 MiB** | 85.5 MiB |
 
 Measured on an Apple M4 Pro with Docker 29.5.2 (linux/arm64), 2026-10-08.
 MinIO is a full distributed object store and does far more; these numbers only show what a test double
@@ -172,7 +179,7 @@ costs in a dev stack.
 <summary>How these were measured</summary>
 
 ```sh
-img=ghcr.io/midagedev/ss33:0.1     # or minio/minio:RELEASE.2025-01-20T14-49-07Z
+img=ghcr.io/midagedev/ss33:0.2     # or minio/minio:RELEASE.2025-01-20T14-49-07Z
 docker save "$img" | gzip | wc -c                     # compressed size
 docker images "$img"                                   # size on disk
 now() { python3 -c 'import time; print(int(time.time() * 1000))'; }
@@ -209,7 +216,8 @@ The full list is in [docs/compatibility.md](docs/compatibility.md).
 ## Verified clients
 
 - **In CI on every change:** aws-sdk-go-v2 (`service/s3` v1.114.1), which the test suite in
-  [`internal/server/sdk_test.go`](internal/server/sdk_test.go) drives. The suite also replays an `mc` bootstrap script.
+  [`internal/server`](internal/server) drives operation by operation. The suite also replays an `mc` bootstrap
+  script.
 - **Checked by hand:**
   - AWS SDK for Java 2.31.1: `S3Client`, `S3AsyncClient` with `multipartEnabled`, and `S3Presigner` for GET, PUT and UploadPart.
   - AWS SDK for JavaScript v3: `@aws-sdk/client-s3` 3.1143.0.

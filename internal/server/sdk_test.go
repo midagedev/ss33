@@ -242,6 +242,17 @@ func TestMultipartAndCopy(t *testing.T) {
 		t.Fatal("copied object differs")
 	}
 
+	// UploadPartCopy is unsupported: it must fail loudly, not store the empty request body as the part.
+	mp, err := c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String("other"), Key: aws.String("partcopy.bin")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.UploadPartCopy(ctx, &s3.UploadPartCopyInput{Bucket: aws.String("other"), Key: aws.String("partcopy.bin"),
+		UploadId: mp.UploadId, PartNumber: aws.Int32(1), CopySource: aws.String("bkt/big.bin")})
+	if errCode(err) != "NotImplemented" {
+		t.Fatalf("UploadPartCopy: want NotImplemented, got %v", err)
+	}
+
 	// Abort leaves nothing behind.
 	created, err := c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String("bkt"), Key: aws.String("aborted")})
 	if err != nil {

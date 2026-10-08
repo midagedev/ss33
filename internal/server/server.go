@@ -363,6 +363,8 @@ func (s *Server) objectOp(w http.ResponseWriter, r *http.Request, bucket, key st
 	switch r.Method {
 	case http.MethodPut:
 		switch {
+		case q.Has("uploadId") && q.Has("partNumber") && r.Header.Get("X-Amz-Copy-Source") != "":
+			s.notImplemented(w, r) // UploadPartCopy
 		case q.Has("uploadId") && q.Has("partNumber"):
 			s.uploadPart(w, r, bucket, key, q)
 		case r.Header.Get("X-Amz-Copy-Source") != "":

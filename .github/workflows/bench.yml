@@ -1,0 +1,75 @@
+name: Benchmark
+
+# The same aws-sdk-go-v2 workload (bench/) against ss33 and other S3-compatible servers on one runner.
+# Results land in the job summary and as an artifact.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: Benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: bench/go.mod
+          cache-dependency-path: bench/go.sum
+
+      - name: Build ss33 image and bench client
+        run: |
+          docker build -t ss33:bench .
+          cd bench && go build -o /tmp/s3bench .
+
+      - name: Run
+        shell: bash
+        run: |
+          set -uo pipefail
+          # bench <label> <container port> <docker run args...>
+          bench() {
+            local label=$1 port=$2; shift 2
+            docker run -d --name s3 -p 9000:"$port" "$@" >/dev/null
+            for _ in $(seq 60); do
+              [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/)" != 000 ] && break
+              sleep 1
+            done
+            sleep 3
+            echo "::group::$label"
+            /tmp/s3bench -ep http://127.0.0.1:9000 -name "$label" -json /tmp/results.jsonl
+            echo "::endgroup::"
+            docker rm -f s3 >/dev/null
+          }
+          creds=(-e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin)
+          bench "ss33" 9000 "${creds[@]}" -e SS33_QUIET=1 ss33:bench server /data
+          bench "ss33 --durable" 9000 "${creds[@]}" -e SS33_QUIET=1 -e SS33_DURABLE=1 ss33:bench server /data
+          bench "RustFS 1.0.1" 9000 "${creds[@]}" rustfs/rustfs:1.0.1 server /data
+          bench "SeaweedFS 4.48" 8333 -e AWS_ACCESS_KEY_ID=minioadmin -e AWS_SECRET_ACCESS_KEY=minioadmin chrislusf/seaweedfs:4.48 mini -dir=/data
+          bench "versitygw 1.8.0" 9000 -e ROOT_ACCESS_KEY=minioadmin -e ROOT_SECRET_KEY=minioadmin \
+            --entrypoint sh versity/versitygw:v1.8.0 -c 'mkdir -p /data && exec versitygw --port :9000 posix /data'
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## S3 benchmark"
+            echo
+            echo "Runner: $(nproc) vCPU, $(free -g | awk '/Mem:/ {print $2}') GiB RAM, kernel $(uname -r), Docker $(docker version --format '{{.Server.Version}}')."
+            echo "Client: aws-sdk-go-v2 (bench/), one server at a time, data on the container filesystem."
+            echo
+            python3 bench/table.py /tmp/results.jsonl
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: /tmp/results.jsonl

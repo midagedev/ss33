@@ -58,10 +58,15 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  ss33 serve [--addr :9000] [--data ./data] [--access-key K] [--secret-key S] [--region us-east-1]
+  ss33 serve [--addr :9000] [--data ./data] [--access-key K] [--secret-key S] [--region us-east-1] [--durable]
   ss33 server <data-dir> [--address :9000]      (MinIO-compatible invocation)
   ss33 mc <alias|mb|rb|ls|cp|anonymous|ready> ...  (also: run the binary as "mc")
   ss33 healthcheck [http://127.0.0.1:9000]`)
+}
+
+func boolFlag(a string) bool {
+	name := strings.TrimLeft(a, "-")
+	return name == "quiet" || name == "durable"
 }
 
 func envOr(keys []string, def string) string {
@@ -83,6 +88,7 @@ func serve(args []string) error {
 	secret := fs.String("secret-key", envOr([]string{"SS33_SECRET_KEY", "MINIO_ROOT_PASSWORD", "MINIO_SECRET_KEY"}, "ss33secret"), "secret key")
 	region := fs.String("region", envOr([]string{"SS33_REGION", "MINIO_REGION"}, "us-east-1"), "region reported to clients")
 	quiet := fs.Bool("quiet", os.Getenv("SS33_QUIET") != "", "do not log requests")
+	durable := fs.Bool("durable", os.Getenv("SS33_DURABLE") != "", "fsync every write before acknowledging it (slower; off by default)")
 
 	// MinIO style: `server /data --console-address :9001` — the first positional argument is the data dir.
 	var flagArgs []string
@@ -93,7 +99,7 @@ func serve(args []string) error {
 			continue
 		}
 		flagArgs = append(flagArgs, a)
-		if !strings.Contains(a, "=") && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && a != "--quiet" && a != "-quiet" {
+		if !strings.Contains(a, "=") && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && !boolFlag(a) {
 			flagArgs = append(flagArgs, args[i+1])
 			i++
 		}
@@ -106,6 +112,7 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	st.Durable = *durable
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	srv := &server.Server{Store: st, Creds: sigv4.Credentials{AccessKey: *access, SecretKey: *secret}, Region: *region}
 	if !*quiet {
@@ -121,7 +128,7 @@ func serve(args []string) error {
 		defer cancel()
 		httpSrv.Shutdown(shutdownCtx)
 	}()
-	logger.Info("ss33 listening", "addr", *addr, "data", *data, "region", *region)
+	logger.Info("ss33 listening", "addr", *addr, "data", *data, "region", *region, "durable", *durable)
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

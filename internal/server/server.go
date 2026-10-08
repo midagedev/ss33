@@ -523,12 +523,25 @@ var responseOverrides = map[string]string{
 }
 
 func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
-	meta, f, err := s.Store.OpenObject(bucket, key)
-	if err != nil {
-		s.storeErr(w, r, err)
-		return
+	var meta store.ObjectMeta
+	var body io.ReadSeeker
+	if r.Method == http.MethodHead {
+		// HEAD never reads the body: answer from the in-memory index without touching the disk.
+		m, err := s.Store.HeadObject(bucket, key)
+		if err != nil {
+			s.storeErr(w, r, err)
+			return
+		}
+		meta, body = m, io.NewSectionReader(zeros{}, 0, m.Size)
+	} else {
+		m, f, err := s.Store.OpenObject(bucket, key)
+		if err != nil {
+			s.storeErr(w, r, err)
+			return
+		}
+		defer f.Close()
+		meta, body = m, f
 	}
-	defer f.Close()
 	h := w.Header()
 	h.Set("Content-Type", meta.ContentType)
 	h.Set("ETag", meta.ETag)
@@ -545,7 +558,15 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, bucket, key s
 		}
 	}
 	// ServeContent handles Range, If-Range, If-None-Match and HEAD.
-	http.ServeContent(w, r, "", meta.LastModified, f)
+	http.ServeContent(w, r, "", meta.LastModified, body)
+}
+
+// zeros backs the HEAD body; ServeContent only seeks it (a multi-range HEAD may read and discard).
+type zeros struct{}
+
+func (zeros) ReadAt(p []byte, _ int64) (int, error) {
+	clear(p)
+	return len(p), nil
 }
 
 // --- multipart ---

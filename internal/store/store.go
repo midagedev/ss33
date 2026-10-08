@@ -1,15 +1,23 @@
 // Package store keeps buckets and objects in a plain directory tree.
 //
-//	<root>/<bucket>/.bucket.json      bucket metadata (creation time, policy)
-//	<root>/<bucket>/<sha256(key)>.bin object bytes
-//	<root>/<bucket>/<sha256(key)>.json object metadata (key, size, etag, headers)
-//	<root>/.uploads/<uploadId>/...    in-progress multipart uploads
+//	<root>/<bucket>/.bucket.json        bucket metadata (creation time, policy)
+//	<root>/<bucket>/.meta.log           append-only journal of object metadata (one JSON record per line)
+//	<root>/<bucket>/<sha256(key)>.bin   object bytes
+//	<root>/<bucket>/<sha256(key)>.parts/ object bytes of a completed multipart upload, one file per part
+//	<root>/.uploads/<uploadId>/         in-progress multipart uploads; parts are named p<number>-<md5>
 //
 // Object files are named by key hash because S3 keys go up to 1024 bytes and may contain both "a" and
-// "a/b" — neither fits a filesystem path directly. An in-memory index answers listings.
+// "a/b" — neither fits a filesystem path directly. All metadata lives in memory; the journal only rebuilds
+// it on start, so a PUT costs one data file plus one appended line. Completing a multipart upload moves
+// the part files into place instead of concatenating them.
+//
+// By default nothing is fsynced: ss33 is a test double and the OS page cache is the fast path. Durable
+// makes every write reach the disk before it is acknowledged.
 package store
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
@@ -49,6 +57,7 @@ type ObjectMeta struct {
 	ContentType  string            `json:"contentType,omitempty"`
 	Headers      map[string]string `json:"headers,omitempty"`  // Content-Disposition, Cache-Control, ...
 	UserMeta     map[string]string `json:"userMeta,omitempty"` // x-amz-meta-* without the prefix, lowercased
+	Parts        []int64           `json:"parts,omitempty"`    // part sizes when the bytes live in <hash>.parts/
 }
 
 type BucketMeta struct {
@@ -65,6 +74,9 @@ func (b BucketMeta) PublicRead() bool {
 }
 
 type Store struct {
+	// Durable fsyncs object data, the journal and directory entries before a write is acknowledged.
+	Durable bool
+
 	root    string
 	mu      sync.RWMutex
 	buckets map[string]*bucket
@@ -73,6 +85,14 @@ type Store struct {
 type bucket struct {
 	meta    BucketMeta
 	objects map[string]ObjectMeta
+	log     *os.File // .meta.log, opened for append
+	records int      // lines in the journal; compaction starts when this far outgrows len(objects)
+}
+
+// record is one journal line: either a put (full metadata) or a delete.
+type record struct {
+	Put *ObjectMeta `json:"put,omitempty"`
+	Del string      `json:"del,omitempty"`
 }
 
 func Open(root string) (*Store, error) {
@@ -88,23 +108,150 @@ func Open(root string) (*Store, error) {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
-		b := &bucket{objects: map[string]ObjectMeta{}}
-		if err := readJSON(filepath.Join(root, e.Name(), ".bucket.json"), &b.meta); err != nil {
-			continue
+		b, err := s.loadBucket(e.Name())
+		if err != nil {
+			return nil, fmt.Errorf("bucket %s: %w", e.Name(), err)
 		}
-		files, _ := os.ReadDir(filepath.Join(root, e.Name()))
-		for _, f := range files {
-			if !strings.HasSuffix(f.Name(), ".json") || f.Name() == ".bucket.json" {
-				continue
-			}
-			var m ObjectMeta
-			if readJSON(filepath.Join(root, e.Name(), f.Name()), &m) == nil {
-				b.objects[m.Key] = m
-			}
+		if b != nil {
+			s.buckets[e.Name()] = b
 		}
-		s.buckets[e.Name()] = b
 	}
 	return s, nil
+}
+
+// Close releases the journals.
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, b := range s.buckets {
+		b.log.Close()
+	}
+	return nil
+}
+
+func (s *Store) loadBucket(name string) (*bucket, error) {
+	dir := s.bucketDir(name)
+	b := &bucket{objects: map[string]ObjectMeta{}}
+	if readJSON(filepath.Join(dir, ".bucket.json"), &b.meta) != nil {
+		return nil, nil // not a bucket directory
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var legacy []string
+	for _, f := range files {
+		n := f.Name()
+		switch {
+		case strings.HasPrefix(n, ".put-"), strings.HasPrefix(n, ".mpu-"), strings.Contains(n, ".trash-"), n == ".meta.log.tmp":
+			os.RemoveAll(filepath.Join(dir, n)) // left behind by an interrupted write
+		case n != ".bucket.json" && strings.HasSuffix(n, ".json"):
+			// v0.1 kept one <hash>.json per object; fold them into the journal.
+			var m ObjectMeta
+			if readJSON(filepath.Join(dir, n), &m) == nil {
+				b.objects[m.Key] = m
+			}
+			legacy = append(legacy, filepath.Join(dir, n))
+		}
+	}
+	if err := replay(filepath.Join(dir, ".meta.log"), b.objects); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if err := s.compact(name, b); err != nil {
+		return nil, err
+	}
+	for _, p := range legacy {
+		os.Remove(p)
+	}
+	return b, nil
+}
+
+// replay applies journal records in order. A torn last line (crash mid-append) is ignored.
+func replay(path string, objects map[string]ObjectMeta) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64<<10), 16<<20)
+	for sc.Scan() {
+		var rec record
+		if json.Unmarshal(sc.Bytes(), &rec) != nil {
+			continue
+		}
+		if rec.Put != nil {
+			objects[rec.Put.Key] = *rec.Put
+		} else if rec.Del != "" {
+			delete(objects, rec.Del)
+		}
+	}
+	return sc.Err()
+}
+
+// compact rewrites the journal with one record per live object and reopens it for append.
+// Callers hold s.mu (or own b exclusively during Open).
+func (s *Store) compact(name string, b *bucket) error {
+	path := filepath.Join(s.bucketDir(name), ".meta.log")
+	var buf bytes.Buffer
+	for _, m := range b.objects {
+		line, err := json.Marshal(record{Put: &m})
+		if err != nil {
+			return err
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	if err := s.writeFile(path+".tmp", buf.Bytes()); err != nil {
+		return err
+	}
+	if b.log != nil {
+		b.log.Close()
+	}
+	if err := os.Rename(path+".tmp", path); err != nil {
+		return err
+	}
+	log, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	b.log, b.records = log, len(b.objects)
+	return s.syncDir(s.bucketDir(name))
+}
+
+// appendRecord journals one change and returns the journal to sync once the lock is released, so
+// concurrent durable writers share fsyncs instead of queueing behind each other. Callers hold s.mu.
+func (s *Store) appendRecord(name string, b *bucket, line []byte) (*os.File, error) {
+	if _, err := b.log.Write(line); err != nil {
+		return nil, err
+	}
+	b.records++
+	if b.records > 2*len(b.objects)+1024 {
+		return nil, s.compact(name, b) // compact syncs the rewritten journal itself
+	}
+	return b.log, nil
+}
+
+// commit makes a journaled change durable after the lock is released. A journal closed by a concurrent
+// compaction is fine: compaction rewrote and synced every live record.
+func (s *Store) commit(log *os.File, dir string) error {
+	if !s.Durable {
+		return nil
+	}
+	if err := s.syncDir(dir); err != nil {
+		return err
+	}
+	if log != nil {
+		if err := log.Sync(); err != nil && !errors.Is(err, os.ErrClosed) {
+			return err
+		}
+	}
+	return nil
+}
+
+func journalLine(rec record) ([]byte, error) {
+	line, err := json.Marshal(rec)
+	return append(line, '\n'), err
 }
 
 func (s *Store) bucketDir(name string) string { return filepath.Join(s.root, name) }
@@ -123,29 +270,40 @@ func (s *Store) CreateBucket(name string) error {
 	if _, ok := s.buckets[name]; ok {
 		return ErrBucketExists
 	}
-	meta := BucketMeta{Name: name, Created: time.Now().UTC()}
+	b := &bucket{meta: BucketMeta{Name: name, Created: time.Now().UTC()}, objects: map[string]ObjectMeta{}}
 	if err := os.MkdirAll(s.bucketDir(name), 0o755); err != nil {
 		return err
 	}
-	if err := writeJSON(filepath.Join(s.bucketDir(name), ".bucket.json"), meta); err != nil {
+	if err := s.writeJSON(filepath.Join(s.bucketDir(name), ".bucket.json"), b.meta); err != nil {
 		return err
 	}
-	s.buckets[name] = &bucket{meta: meta, objects: map[string]ObjectMeta{}}
-	return nil
+	if err := s.compact(name, b); err != nil {
+		return err
+	}
+	s.buckets[name] = b
+	return s.syncDir(s.root)
 }
 
 func (s *Store) DeleteBucket(name string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	b, ok := s.buckets[name]
 	if !ok {
+		s.mu.Unlock()
 		return ErrNoSuchBucket
 	}
 	if len(b.objects) > 0 {
+		s.mu.Unlock()
 		return ErrBucketNotEmpty
 	}
+	b.log.Close()
 	delete(s.buckets, name)
-	return os.RemoveAll(s.bucketDir(name))
+	trash := filepath.Join(s.root, "."+name+".trash-"+randomID()) // dot-prefixed: Open skips it
+	err := os.Rename(s.bucketDir(name), trash)
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(trash)
 }
 
 func (s *Store) Bucket(name string) (BucketMeta, error) {
@@ -177,7 +335,7 @@ func (s *Store) SetPolicy(name, policy string) error {
 		return ErrNoSuchBucket
 	}
 	b.meta.Policy = policy
-	return writeJSON(filepath.Join(s.bucketDir(name), ".bucket.json"), b.meta)
+	return s.writeJSON(filepath.Join(s.bucketDir(name), ".bucket.json"), b.meta)
 }
 
 // PutObject streams body to disk, then publishes the metadata. meta.Key/ContentType/Headers/UserMeta come
@@ -186,42 +344,83 @@ func (s *Store) PutObject(bucketName string, meta ObjectMeta, body io.Reader) (O
 	if _, err := s.Bucket(bucketName); err != nil {
 		return ObjectMeta{}, err
 	}
-	dir := s.bucketDir(bucketName)
-	tmp, err := os.CreateTemp(dir, ".put-*")
+	tmp, err := os.CreateTemp(s.bucketDir(bucketName), ".put-*")
 	if err != nil {
 		return ObjectMeta{}, err
 	}
-	defer os.Remove(tmp.Name())
 	h := md5.New()
 	n, err := io.Copy(io.MultiWriter(tmp, h), body)
+	if err == nil && s.Durable {
+		err = tmp.Sync()
+	}
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
+		os.Remove(tmp.Name())
 		return ObjectMeta{}, err
 	}
 	meta.Size = n
 	meta.ETag = `"` + hex.EncodeToString(h.Sum(nil)) + `"`
-	return s.publish(bucketName, meta, tmp.Name())
+	meta.Parts = nil
+	out, err := s.publish(bucketName, meta, tmp.Name())
+	if err != nil {
+		os.Remove(tmp.Name())
+	}
+	return out, err
 }
 
-func (s *Store) publish(bucketName string, meta ObjectMeta, dataPath string) (ObjectMeta, error) {
+// publish moves data (a file, or a directory of parts when meta.Parts is set) into place and journals meta.
+// The lock covers only renames and one append; whatever the new version replaces is deleted afterwards.
+func (s *Store) publish(bucketName string, meta ObjectMeta, data string) (ObjectMeta, error) {
 	meta.LastModified = time.Now().UTC().Truncate(time.Millisecond)
+	line, err := journalLine(record{Put: &meta})
+	if err != nil {
+		return ObjectMeta{}, err
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	b, ok := s.buckets[bucketName]
 	if !ok {
+		s.mu.Unlock()
 		return ObjectMeta{}, ErrNoSuchBucket
 	}
 	base := objectBase(s.bucketDir(bucketName), meta.Key)
-	if err := os.Rename(dataPath, base+".bin"); err != nil {
+	var garbage string
+	if old, ok := b.objects[meta.Key]; ok && (old.Parts != nil || meta.Parts != nil) {
+		garbage = s.unlinkData(base, old) // a file-over-file rename replaces atomically on its own
+	}
+	target := base + ".bin"
+	if meta.Parts != nil {
+		target = base + ".parts"
+	}
+	if err := os.Rename(data, target); err != nil {
+		s.mu.Unlock()
 		return ObjectMeta{}, err
 	}
-	if err := writeJSON(base+".json", meta); err != nil {
-		return ObjectMeta{}, err
-	}
+	log, err := s.appendRecord(bucketName, b, line)
 	b.objects[meta.Key] = meta
-	return meta, nil
+	s.mu.Unlock()
+	if err == nil {
+		err = s.commit(log, s.bucketDir(bucketName))
+	}
+	if garbage != "" {
+		os.RemoveAll(garbage)
+	}
+	return meta, err
+}
+
+// unlinkData removes an object's bytes from their visible path. A plain file is unlinked in place (open
+// readers keep it); a parts directory is renamed aside and returned so the caller deletes it unlocked.
+func (s *Store) unlinkData(base string, m ObjectMeta) (garbage string) {
+	if m.Parts == nil {
+		os.Remove(base + ".bin")
+		return ""
+	}
+	garbage = base + ".trash-" + randomID()
+	if os.Rename(base+".parts", garbage) != nil {
+		return ""
+	}
+	return garbage
 }
 
 func (s *Store) HeadObject(bucketName, key string) (ObjectMeta, error) {
@@ -238,49 +437,95 @@ func (s *Store) HeadObject(bucketName, key string) (ObjectMeta, error) {
 	return m, nil
 }
 
-// OpenObject returns the metadata and an open file; the caller closes it.
-func (s *Store) OpenObject(bucketName, key string) (ObjectMeta, *os.File, error) {
-	m, err := s.HeadObject(bucketName, key)
-	if err != nil {
-		return m, nil, err
+// Object is an open object body. Single-file objects are an *os.File, so GET keeps the sendfile path.
+type Object interface {
+	io.ReadSeeker
+	io.Closer
+}
+
+// OpenObject returns the metadata and the opened body; the caller closes it. Files are opened under the
+// read lock, so a concurrent overwrite or delete cannot pull them away mid-read.
+func (s *Store) OpenObject(bucketName, key string) (ObjectMeta, Object, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	b, ok := s.buckets[bucketName]
+	if !ok {
+		return ObjectMeta{}, nil, ErrNoSuchBucket
 	}
-	f, err := os.Open(objectBase(s.bucketDir(bucketName), key) + ".bin")
-	if err != nil {
-		return m, nil, err
+	m, ok := b.objects[key]
+	if !ok {
+		return ObjectMeta{}, nil, ErrNoSuchKey
 	}
-	return m, f, nil
+	base := objectBase(s.bucketDir(bucketName), key)
+	if m.Parts == nil {
+		f, err := os.Open(base + ".bin")
+		return m, f, err
+	}
+	pr, err := openParts(base+".parts", m.Parts)
+	return m, pr, err
 }
 
 // DeleteObject is idempotent like S3: deleting a missing key succeeds.
 func (s *Store) DeleteObject(bucketName, key string) error {
+	line, err := journalLine(record{Del: key})
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	b, ok := s.buckets[bucketName]
 	if !ok {
+		s.mu.Unlock()
 		return ErrNoSuchBucket
 	}
-	if _, ok := b.objects[key]; !ok {
+	old, ok := b.objects[key]
+	if !ok {
+		s.mu.Unlock()
 		return nil
 	}
-	base := objectBase(s.bucketDir(bucketName), key)
-	os.Remove(base + ".bin")
-	os.Remove(base + ".json")
+	garbage := s.unlinkData(objectBase(s.bucketDir(bucketName), key), old)
 	delete(b.objects, key)
-	return nil
+	log, err := s.appendRecord(bucketName, b, line)
+	s.mu.Unlock()
+	if err == nil {
+		err = s.commit(log, s.bucketDir(bucketName))
+	}
+	if garbage != "" {
+		os.RemoveAll(garbage)
+	}
+	return err
 }
 
-// CopyObject copies bytes server-side. When replace is nil the source metadata is kept (COPY directive).
+// CopyObject copies an object server-side. When replace is nil the source metadata is kept (COPY
+// directive). A single-file source is hard-linked, so the copy costs no data I/O.
 func (s *Store) CopyObject(srcBucket, srcKey, dstBucket, dstKey string, replace *ObjectMeta) (ObjectMeta, error) {
-	src, f, err := s.OpenObject(srcBucket, srcKey)
+	src, err := s.HeadObject(srcBucket, srcKey)
 	if err != nil {
 		return ObjectMeta{}, err
 	}
-	defer f.Close()
+	if _, err := s.Bucket(dstBucket); err != nil {
+		return ObjectMeta{}, err
+	}
 	meta := src
 	if replace != nil {
 		meta = *replace
 	}
 	meta.Key = dstKey
+	if src.Parts == nil {
+		tmp := filepath.Join(s.bucketDir(dstBucket), ".put-"+randomID())
+		if os.Link(objectBase(s.bucketDir(srcBucket), srcKey)+".bin", tmp) == nil {
+			meta.Size, meta.ETag, meta.Parts = src.Size, src.ETag, nil
+			out, err := s.publish(dstBucket, meta, tmp)
+			if err != nil {
+				os.Remove(tmp)
+			}
+			return out, err
+		}
+	}
+	_, f, err := s.OpenObject(srcBucket, srcKey)
+	if err != nil {
+		return ObjectMeta{}, err
+	}
+	defer f.Close()
 	return s.PutObject(dstBucket, meta, f)
 }
 
@@ -363,13 +608,11 @@ func (s *Store) CreateUpload(bucketName string, meta ObjectMeta) (string, error)
 	if _, err := s.Bucket(bucketName); err != nil {
 		return "", err
 	}
-	buf := make([]byte, 16)
-	rand.Read(buf)
-	id := hex.EncodeToString(buf)
+	id := randomID()
 	if err := os.MkdirAll(s.uploadDir(id), 0o755); err != nil {
 		return "", err
 	}
-	return id, writeJSON(filepath.Join(s.uploadDir(id), "upload.json"), upload{Bucket: bucketName, Meta: meta, Created: time.Now().UTC()})
+	return id, s.writeJSON(filepath.Join(s.uploadDir(id), "upload.json"), upload{Bucket: bucketName, Meta: meta, Created: time.Now().UTC()})
 }
 
 func (s *Store) loadUpload(bucketName, key, id string) (upload, error) {
@@ -383,99 +626,133 @@ func (s *Store) loadUpload(bucketName, key, id string) (upload, error) {
 	return u, nil
 }
 
+// PutPart stores a part as p<number>-<md5>, so listing and completing never re-read part data.
 func (s *Store) PutPart(bucketName, key, id string, number int, body io.Reader) (string, error) {
 	if _, err := s.loadUpload(bucketName, key, id); err != nil {
 		return "", err
 	}
-	f, err := os.Create(filepath.Join(s.uploadDir(id), fmt.Sprintf("part-%05d", number)))
+	dir := s.uploadDir(id)
+	f, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
 		return "", err
 	}
 	h := md5.New()
 	_, err = io.Copy(io.MultiWriter(f, h), body)
+	if err == nil && s.Durable {
+		err = f.Sync()
+	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
+		os.Remove(f.Name())
 		return "", err
 	}
-	return `"` + hex.EncodeToString(h.Sum(nil)) + `"`, nil
+	sum := hex.EncodeToString(h.Sum(nil))
+	prefix := fmt.Sprintf("p%05d-", number)
+	if old, _ := filepath.Glob(filepath.Join(dir, prefix+"*")); len(old) > 0 {
+		for _, p := range old {
+			os.Remove(p)
+		}
+	}
+	if err := os.Rename(f.Name(), filepath.Join(dir, prefix+sum)); err != nil {
+		return "", err
+	}
+	return `"` + sum + `"`, s.syncDir(dir)
+}
+
+type storedPart struct {
+	Part
+	file string
+}
+
+func (s *Store) parts(id string) (map[int]storedPart, error) {
+	entries, err := os.ReadDir(s.uploadDir(id))
+	if err != nil {
+		return nil, err
+	}
+	out := map[int]storedPart{}
+	for _, e := range entries {
+		num, sum, ok := strings.Cut(strings.TrimPrefix(e.Name(), "p"), "-")
+		if !ok || !strings.HasPrefix(e.Name(), "p") {
+			continue
+		}
+		n, err := strconv.Atoi(num)
+		if err != nil {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue // replaced while listing
+		}
+		out[n] = storedPart{Part{Number: n, ETag: `"` + sum + `"`, Size: info.Size()}, filepath.Join(s.uploadDir(id), e.Name())}
+	}
+	return out, nil
 }
 
 func (s *Store) ListParts(bucketName, key, id string) ([]Part, error) {
 	if _, err := s.loadUpload(bucketName, key, id); err != nil {
 		return nil, err
 	}
-	entries, err := os.ReadDir(s.uploadDir(id))
+	stored, err := s.parts(id)
 	if err != nil {
 		return nil, err
 	}
-	var parts []Part
-	for _, e := range entries {
-		num, ok := strings.CutPrefix(e.Name(), "part-")
-		if !ok {
-			continue
-		}
-		n, _ := strconv.Atoi(num)
-		etag, size, err := fileMD5(filepath.Join(s.uploadDir(id), e.Name()))
-		if err != nil {
-			return nil, err
-		}
-		parts = append(parts, Part{Number: n, ETag: etag, Size: size})
+	out := make([]Part, 0, len(stored))
+	for _, p := range stored {
+		out = append(out, p.Part)
 	}
-	return parts, nil
+	sort.Slice(out, func(i, j int) bool { return out[i].Number < out[j].Number })
+	return out, nil
 }
 
-// CompleteUpload concatenates the requested parts in order. The resulting ETag follows S3:
-// md5(concat(md5(part)...)) + "-" + count.
+// CompleteUpload moves the requested parts into the object's parts directory — no bytes are copied. The
+// resulting ETag follows S3: md5(concat(md5(part)...)) + "-" + count.
 func (s *Store) CompleteUpload(bucketName, key, id string, requested []Part) (ObjectMeta, error) {
 	u, err := s.loadUpload(bucketName, key, id)
 	if err != nil {
 		return ObjectMeta{}, err
 	}
-	tmp, err := os.CreateTemp(s.bucketDir(bucketName), ".mpu-*")
+	stored, err := s.parts(id)
 	if err != nil {
 		return ObjectMeta{}, err
 	}
-	defer os.Remove(tmp.Name())
-	etags := md5.New()
-	var size int64
 	last := 0
 	for _, p := range requested {
 		if p.Number <= last {
-			tmp.Close()
 			return ObjectMeta{}, ErrInvalidPartOrder
 		}
 		last = p.Number
-		path := filepath.Join(s.uploadDir(id), fmt.Sprintf("part-%05d", p.Number))
-		etag, _, err := fileMD5(path)
-		if err != nil || strings.Trim(etag, `"`) != strings.Trim(p.ETag, `"`) {
-			tmp.Close()
+		if sp, ok := stored[p.Number]; !ok || sp.ETag != `"`+strings.Trim(p.ETag, `"`)+`"` {
 			return ObjectMeta{}, ErrInvalidPart
 		}
-		raw, _ := hex.DecodeString(strings.Trim(etag, `"`))
-		etags.Write(raw)
-		f, err := os.Open(path)
-		if err != nil {
-			tmp.Close()
-			return ObjectMeta{}, err
-		}
-		n, err := io.Copy(tmp, f)
-		f.Close()
-		if err != nil {
-			tmp.Close()
-			return ObjectMeta{}, err
-		}
-		size += n
 	}
-	if err := tmp.Close(); err != nil {
+	dir := filepath.Join(s.bucketDir(bucketName), ".mpu-"+id)
+	if err := os.Mkdir(dir, 0o755); err != nil {
 		return ObjectMeta{}, err
 	}
+	etags := md5.New()
 	meta := u.Meta
-	meta.Size = size
+	meta.Size, meta.Parts = 0, make([]int64, 0, len(requested))
+	for i, p := range requested {
+		sp := stored[p.Number]
+		if err := os.Rename(sp.file, filepath.Join(dir, fmt.Sprintf("%05d", i))); err != nil {
+			os.RemoveAll(dir)
+			return ObjectMeta{}, err
+		}
+		raw, _ := hex.DecodeString(strings.Trim(sp.ETag, `"`))
+		etags.Write(raw)
+		meta.Size += sp.Size
+		meta.Parts = append(meta.Parts, sp.Size)
+	}
+	if err := s.syncDir(dir); err != nil {
+		os.RemoveAll(dir)
+		return ObjectMeta{}, err
+	}
 	meta.ETag = fmt.Sprintf(`"%s-%d"`, hex.EncodeToString(etags.Sum(nil)), len(requested))
-	out, err := s.publish(bucketName, meta, tmp.Name())
+	out, err := s.publish(bucketName, meta, dir)
 	if err != nil {
+		os.RemoveAll(dir)
 		return ObjectMeta{}, err
 	}
 	os.RemoveAll(s.uploadDir(id))
@@ -489,29 +766,128 @@ func (s *Store) AbortUpload(bucketName, key, id string) error {
 	return os.RemoveAll(s.uploadDir(id))
 }
 
-// --- helpers ---
-
-func fileMD5(path string) (string, int64, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", 0, err
-	}
-	defer f.Close()
-	h := md5.New()
-	n, err := io.Copy(h, f)
-	return `"` + hex.EncodeToString(h.Sum(nil)) + `"`, n, err
+// partsReader reads a multipart object straight from its part files.
+type partsReader struct {
+	files []*os.File
+	ends  []int64 // cumulative end offset of each part
+	off   int64
 }
 
-func writeJSON(path string, v any) error {
+func openParts(dir string, sizes []int64) (*partsReader, error) {
+	p := &partsReader{}
+	var end int64
+	for i, size := range sizes {
+		f, err := os.Open(filepath.Join(dir, fmt.Sprintf("%05d", i)))
+		if err != nil {
+			p.Close()
+			return nil, err
+		}
+		end += size
+		p.files = append(p.files, f)
+		p.ends = append(p.ends, end)
+	}
+	return p, nil
+}
+
+func (p *partsReader) size() int64 {
+	if len(p.ends) == 0 {
+		return 0
+	}
+	return p.ends[len(p.ends)-1]
+}
+
+func (p *partsReader) Read(b []byte) (int, error) {
+	if p.off >= p.size() {
+		return 0, io.EOF
+	}
+	i := sort.Search(len(p.ends), func(i int) bool { return p.ends[i] > p.off })
+	start := int64(0)
+	if i > 0 {
+		start = p.ends[i-1]
+	}
+	if left := p.ends[i] - p.off; int64(len(b)) > left {
+		b = b[:left]
+	}
+	n, err := p.files[i].ReadAt(b, p.off-start)
+	p.off += int64(n)
+	if err == io.EOF {
+		if n < len(b) {
+			return n, io.ErrUnexpectedEOF // part file shorter than recorded
+		}
+		err = nil
+	}
+	return n, err
+}
+
+func (p *partsReader) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekCurrent:
+		offset += p.off
+	case io.SeekEnd:
+		offset += p.size()
+	}
+	if offset < 0 {
+		return 0, errors.New("negative position")
+	}
+	p.off = offset
+	return offset, nil
+}
+
+func (p *partsReader) Close() error {
+	for _, f := range p.files {
+		f.Close()
+	}
+	return nil
+}
+
+// --- helpers ---
+
+func randomID() string {
+	buf := make([]byte, 16)
+	rand.Read(buf)
+	return hex.EncodeToString(buf)
+}
+
+func (s *Store) writeJSON(path string, v any) error {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := s.writeFile(path+".tmp", data); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(path+".tmp", path); err != nil {
+		return err
+	}
+	return s.syncDir(filepath.Dir(path))
+}
+
+func (s *Store) writeFile(path string, data []byte) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err == nil && s.Durable {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// syncDir makes renames and new entries in dir durable. A no-op unless Durable.
+func (s *Store) syncDir(dir string) error {
+	if !s.Durable {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func readJSON(path string, v any) error {

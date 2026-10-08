@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -209,12 +210,25 @@ func candidateURIs(r *http.Request) []string {
 func signature(secret, scope, date, amzDate, canonicalRequest string) string {
 	hash := sha256.Sum256([]byte(canonicalRequest))
 	stringToSign := strings.Join([]string{Algorithm, amzDate, scope, hex.EncodeToString(hash[:])}, "\n")
+	return hex.EncodeToString(hmacSHA256(signingKey(secret, scope, date), stringToSign))
+}
+
+// signingKeys caches derived keys: they change once a day per secret and region, but deriving one costs
+// four HMACs on every request.
+var signingKeys sync.Map // secret + "\x00" + scope -> []byte
+
+func signingKey(secret, scope, date string) []byte {
+	id := secret + "\x00" + scope
+	if k, ok := signingKeys.Load(id); ok {
+		return k.([]byte)
+	}
 	scopeParts := strings.Split(scope, "/")
 	key := hmacSHA256([]byte("AWS4"+secret), date)
 	key = hmacSHA256(key, scopeParts[1])
 	key = hmacSHA256(key, scopeParts[2])
 	key = hmacSHA256(key, "aws4_request")
-	return hex.EncodeToString(hmacSHA256(key, stringToSign))
+	signingKeys.Store(id, key)
+	return key
 }
 
 func hmacSHA256(key []byte, data string) []byte {

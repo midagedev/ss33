@@ -61,17 +61,19 @@ var commandFlags = map[string]map[string]bool{
 var globalFlags = map[string]bool{
 	"json": true, "quiet": true, "no-color": true, "debug": true, "insecure": true,
 	"disable-pager": true, "config-dir": true, "help": true,
+	"limit-upload": true, "limit-download": true, "custom-header": true, "resolve": true,
 }
 
 var valueFlags = map[string]bool{
 	"api": true, "path": true, "attr": true, "version-id": true,
 	"event": true, "prefix": true, "suffix": true, "lines": true,
 	"name": true, "config-dir": true,
+	"limit-upload": true, "limit-download": true, "custom-header": true, "resolve": true,
 }
 
 // shortFlags maps each short or alternate spelling to the name the tables above use.
 var shortFlags = map[string]string{
-	"q": "quiet", "r": "recursive", "dp": "disable-pager", "C": "config-dir", "vid": "version-id", "n": "lines", "h": "help",
+	"q": "quiet", "r": "recursive", "dp": "disable-pager", "C": "config-dir", "vid": "version-id", "n": "lines", "h": "help", "H": "custom-header",
 }
 
 func implementedList() string {

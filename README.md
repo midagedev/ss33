@@ -255,6 +255,7 @@ Every push runs these against the image built from that commit ([`clients/`](cli
 | AWS SDK for Java 2.55 | `S3Client`, `S3AsyncClient` with `multipartEnabled`, `S3Presigner` for GET, PUT and UploadPart |
 | AWS CLI v2 | `s3 mb/cp/sync/ls/presign/rb --force`, `s3api` tagging and head-object |
 | Official `mc` (last release and RELEASE.2025-01-17) | `alias set`, `ready`, `mb`, `anonymous set`, `cp --recursive`, `ls`, `diff`, `mirror`, `stat`, `cat`, `rm`, `version enable`, `ls --versions`, `rb --force`, and `event add` with a webhook receiving the events |
+| Built-in `mc` vs official `mc` | `--json` field names and order, values and exit codes for `ls`, `stat`, `find`, `du`, `tag`, `anonymous`, `version`, `mb`, `cp`, `rm`, `rb` ([`clients/mc-json.sh`](clients/mc-json.sh)) |
 | Docker registry 3 | The S3 storage driver: push and pull a multi-layer image, delete it, garbage-collect |
 | Terraform, AWS provider 6.68 | A bucket with versioning, encryption, lifecycle, CORS, policy, public access block, ownership controls, website, tags and an object: apply, a plan with no changes, destroy |
 | Testcontainers | Java `MinIOContainer` and Python `MinioContainer` with the image substituted |

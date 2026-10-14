@@ -3,11 +3,12 @@
 ARG BUILDPLATFORM
 FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 ARG TARGETOS TARGETARCH
+ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/ss33 ./cmd/ss33
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w -X github.com/midagedev/ss33/internal/mc.Version=${VERSION}" -o /out/ss33 ./cmd/ss33
 
 # alpine (not distroless): compose healthchecks call `curl`, and bootstrap jobs run `/bin/sh -c "mc ..."`.
 FROM alpine:3.22

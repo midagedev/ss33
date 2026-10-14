@@ -1013,6 +1013,7 @@ func TestParserFlags(t *testing.T) {
 		t.Fatalf("missing value under --json: exit %d %q", code, errb)
 	}
 	e.ok("ls", "--debug", "--no-color", "--insecure", "--disable-pager", "--dp", "-q", "local/bkt")
+	e.ok("ls", "--limit-upload", "10MiB", "--limit-download=1MiB", "-H", "X-A: b", "--resolve", "h:9000=127.0.0.1", "local/bkt")
 
 	dir := t.TempDir()
 	if code, _, errb := e.run("--config-dir="+dir, "alias", "set", "other", e.ts.URL, "admin", "admin-secret"); code != 0 {

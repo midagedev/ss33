@@ -314,10 +314,9 @@ func (c *cli) opErr(op, target string, err error) error {
 	msg := opMessage(op, target, se)
 	objectOp := op == "stat" || op == "cat" || op == "head" || op == "rm" || op == "tag" || op == "pipe" || op == "cp" || op == "mv"
 	if se.Code == "NoSuchBucket" && op != "event" {
-		b := se.Bucket
-		if b == "" {
-			b = bucketOf(target)
-		}
+		// The bucket the server refused, from its Resource (/bucket/key): target may be a local cp source.
+		b, _, _ := strings.Cut(strings.TrimPrefix(se.Resource, "/"), "/")
+		b = cmp.Or(se.Bucket, b, bucketOf(target))
 		return c.fail(msg, fmt.Sprintf("Bucket `%s` does not exist.", b), typ, bucketMissing{Bucket: b})
 	}
 	if se.Code == "NoSuchKey" || (objectOp && se.Status == http.StatusNotFound) {
@@ -351,7 +350,7 @@ func opMessage(op, target string, se *s3err) string {
 	case "stat":
 		return fmt.Sprintf("Unable to stat `%s`.", target)
 	case "cp", "mv":
-		return fmt.Sprintf("Unable to copy `%s`.", target)
+		return fmt.Sprintf("Failed to copy `%s`.", target)
 	case "find":
 		return fmt.Sprintf("Unable to find `%s`.", target)
 	case "du":

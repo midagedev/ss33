@@ -237,7 +237,7 @@ the response.
 | Encryption | SSE-S3/SSE-KMS headers and bucket default encryption reported; SSE-C objects need their key | Actual encryption at rest |
 | Addressing | Path-style; virtual-hosted for `<bucket>.localhost` and `MINIO_DOMAIN` | |
 | Browser | CORS allows every origin and exposes `ETag` | |
-| `mc` | `alias set`, `config host add`, `MC_HOST_<alias>`, `mb [--ignore-existing\|-p]`, `rb [--force]`, `ls [--recursive\|--versions]`, `cp [--recursive]`, `rm [--recursive --force\|--version-id]`, `anonymous\|policy set download\|public\|none`, `version enable\|suspend`, `event add\|ls\|rm`, `ready` | Everything else, including `mc admin` and `mc mirror` |
+| `mc` | `alias set`, `config host add`, `MC_HOST_<alias>`, `mb`, `rb`, `ls [--recursive\|--versions]`, `stat`, `cat`, `head`, `pipe`, `cp`, `mv`, `rm`, `find`, `du`, `tag`, `anonymous set\|get\|get-json\|set-json\|list`, `version`, `event`, `ready`; `--json` output matching the official client field for field | `mirror`, `diff`, `tree`, `mc admin` (use the official `mc` against ss33 for those) |
 
 Unsupported operations return `501 NotImplemented` as an S3 XML error. They never fail silently.
 The full list is in [docs/compatibility.md](docs/compatibility.md).

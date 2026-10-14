@@ -46,10 +46,17 @@ ListMultipartUploads.
   MinIO's defaults, `minioadmin` / `minioadmin`. `MINIO_DOMAIN` and `MINIO_NOTIFY_WEBHOOK_*` work as in MinIO.
 - The image ships the binary as `mc` too, covering:
   - `alias set` and the older `config host add` (`--api`/`--path` values are ignored); `MC_HOST_<alias>=http://KEY:SECRET@host:port` also defines an alias
-  - `mb [--ignore-existing]`, `rb [--force]` (a versioned bucket's versions included)
+  - `mb [--ignore-existing|-p]`, `rb [--force]` (a versioned bucket's versions included)
   - `ls [--recursive]`, `ls --versions`; a bare `ALIAS` lists buckets
-  - `cp [--recursive]`: local→remote, remote→remote and remote→local
-  - `rm ALIAS/BUCKET/KEY`, `rm --version-id ID ALIAS/BUCKET/KEY`, `rm --recursive --force ALIAS/BUCKET[/PREFIX]`
-  - `version enable|suspend`
+  - `stat [--recursive] [--version-id ID]` (exit 1 when the object does not exist), `cat`, `head [-n N]`, `pipe`
+  - `cp [--recursive] [--attr "K=V;K2=V2"]`: local→remote, remote→remote and remote→local; `mv` the same, removing each source
+  - `rm ALIAS/BUCKET/KEY` (exit 1 when it does not exist), `rm --version-id ID ALIAS/BUCKET/KEY`, `rm --recursive --force ALIAS/BUCKET[/PREFIX]`
+  - `find [--name GLOB]`, `du`, `tag set|list|remove`
+  - `version enable|suspend|info`
   - `event add ALIAS/BUCKET ARN [--event put,delete,get] [--prefix P] [--suffix S]`, `event ls`, `event rm ARN` or `--force`
-  - `anonymous set download|public|none` (writing the same policy statements as the official mc), `ready`
+  - `anonymous set download|upload|public|none` (writing the same policy statements as the official mc), `anonymous get|get-json|set-json|list`, `ready`
+  - `--json` (or `MC_JSON=1`) on every command: one JSON object per line with the official client's field names and
+    order, errors as `{"status":"error",...}` on stdout. `clients/mc-json.sh` checks this against the official mc in CI.
+    `--version`, `--config-dir`, and the official global flags are accepted.
+  - An unknown flag fails with exit 1, as in the official client, rather than being ignored. `mirror`, `diff`,
+    `tree` and `admin` are not implemented and fail the same way; the official `mc` works against ss33 for those

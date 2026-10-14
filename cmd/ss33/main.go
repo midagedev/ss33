@@ -60,7 +60,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   ss33 serve [--addr :9000] [--data ./data] [--access-key K] [--secret-key S] [--region us-east-1] [--durable]
   ss33 server <data-dir> [--address :9000]      (MinIO-compatible invocation)
-  ss33 mc <alias|mb|rb|ls|cp|anonymous|ready> ...  (also: run the binary as "mc")
+  ss33 mc [--json] <command> ...                (also: run the binary as "mc"; "ss33 mc --help" lists commands)
   ss33 healthcheck [http://127.0.0.1:9000]`)
 }
 

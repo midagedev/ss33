@@ -1122,6 +1122,12 @@ func TestStreamsAndMetadata(t *testing.T) {
 	if got := e.ok("--json", "cat", "local/bkt/a.txt"); got != "abc" {
 		t.Fatalf("%q", got)
 	}
+	// The missing bucket is the destination's, not a piece of the local source path.
+	src := filepath.Join(t.TempDir(), "f.txt")
+	os.WriteFile(src, []byte("x"), 0o644)
+	if code, _, errb := e.run("cp", src, "local/nobkt/f.txt"); code != 1 || !strings.Contains(errb, "Failed to copy") || !strings.Contains(errb, "Bucket `nobkt` does not exist.") {
+		t.Fatalf("cp to a missing bucket: exit %d %q", code, errb)
+	}
 	withStdin(t, "xyz", func() {
 		if code, out, errb := e.run("pipe", "local/bkt/p.txt"); code != 0 || out != "" {
 			t.Fatalf("pipe: exit %d %q %s", code, out, errb)
